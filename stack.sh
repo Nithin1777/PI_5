@@ -75,6 +75,44 @@ pkill_nodes() { pkill_nav; pkill_slam; pkill_base; }
 
 running() { [ -f /tmp/$1.pid ] && kill -0 "$(cat /tmp/$1.pid 2>/dev/null)" 2>/dev/null; }
 
+# ------------------------------------------------------- readiness waits ------
+# These replace the fixed `sleep`s that `start`/`nav` used to burn (~24 s in
+# `start` alone) regardless of how fast the nodes actually came up. Each wait
+# returns as soon as the node is genuinely ready, bails out early if the process
+# died, and on timeout WARNS but lets bring-up continue (same as the old
+# behaviour -- a wrong marker must never block the demo).
+wait_log() {        # wait_log <node> <pattern> [timeout_s]  -- marker in /tmp/<node>.log
+  local n="$1" pat="$2" tmo="${3:-20}"
+  local end=$((SECONDS + tmo))
+  while [ "$SECONDS" -lt "$end" ]; do
+    grep -qm1 -- "$pat" "/tmp/$n.log" 2>/dev/null && return 0
+    if [ -f "/tmp/$n.pid" ] && ! kill -0 "$(cat "/tmp/$n.pid" 2>/dev/null)" 2>/dev/null; then
+      echo "  [$n] DIED during startup -- see 'logs $n'"; return 2
+    fi
+    sleep 0.2
+  done
+  echo "  [$n] not ready after ${tmo}s (continuing -- see 'logs $n')"; return 1
+}
+
+wait_topic() {      # wait_topic <topic> [timeout_s]  -- a real message arrived
+  local t="$1" tmo="${2:-30}"
+  local end=$((SECONDS + tmo))
+  while [ "$SECONDS" -lt "$end" ]; do
+    timeout 4 ros2 topic echo "$t" --once >/dev/null 2>&1 && return 0
+  done
+  echo "  [wait] no message on $t within ${tmo}s (continuing)"; return 1
+}
+
+wait_node() {       # wait_node <node_name> [timeout_s]
+  local n="$1" tmo="${2:-30}"
+  local end=$((SECONDS + tmo))
+  while [ "$SECONDS" -lt "$end" ]; do
+    timeout 5 ros2 node list 2>/dev/null | grep -qx -- "$n" && return 0
+    sleep 0.5
+  done
+  echo "  [wait] node $n did not appear within ${tmo}s (continuing)"; return 1
+}
+
 wait_nav_up() {   # wait until bt_navigator appears (return_home waits for ACTIVE)
   for i in $(seq 1 40); do
     if timeout 4 ros2 node list 2>/dev/null | grep -q '/bt_navigator'; then return 0; fi
@@ -115,37 +153,40 @@ ensure_amcl_active() {
 
 # ---------------------------------------------------------------- base --------
 do_start() {
+  local t0=$SECONDS
   do_stop >/dev/null 2>&1
-  sleep 1
   echo "[stack] starting lidar (LD19) ......"; /root/rosbg.sh lidar    ros2 launch ldlidar_stl_ros2 ld19.launch.py
   # NOTE: ld19.launch.py is patched to publish /scan_raw (topic_name: scan_raw).
   # scan_normalize.py (next line) resamples it onto a fixed 504-beam /scan for
   # rf2o/slam/AMCL. If the container is ever rebuilt/re-cloned, re-apply the patch:
   #   sed -i "s/{'topic_name': 'scan'}/{'topic_name': 'scan_raw'}/" \
   #     /root/ros2_ws/src/ldlidar_stl_ros2/launch/ld19.launch.py
-  sleep 3
+  wait_log lidar 'Publish topic message' 25 && echo "  [lidar]    OK (publishing /scan_raw)"
   echo "[stack] starting scan_normalize ....."; /root/rosbg.sh scan     python3 /root/scan_normalize.py
-  sleep 2
-  echo "[stack] starting rf2o (laser odom) ."; /root/rosbg.sh rf2o     ros2 launch rf2o_laser_odometry rf2o_laser_odometry.launch.py
-  # NOTE: rf2o_laser_odometry.launch.py is patched 'freq' : 20.0 -> 10.0 (update
-  # timer must match the 10 Hz /scan, else rf2o spams "Waiting for laser_scans"
-  # on every other tick; odometry itself was unaffected). Re-apply if rebuilt:
-  #   sed -i "s/'freq' : 20.0/'freq' : 10.0/" \
-  #     /root/ros2_ws/src/rf2o_laser_odometry/launch/rf2o_laser_odometry.launch.py
-  sleep 3
+  wait_log scan 'scan_normalize ready' 20     && echo "  [scan]     OK (LD19 -> fixed 504-beam /scan)"
+  echo "[stack] starting rf2o (laser odom) ."
+  # rf2o via `ros2 run` + a params file rather than its launch file, so that
+  # --log-level can be passed (ros2 launch cannot forward --ros-args to a node).
+  # rf2o logs 3 INFO lines PER SCAN at 10 Hz -- measured 3.8 KB/s into
+  # /tmp/rf2o.log (~330 MB/day, never rotated) plus the format+write cost in the
+  # odometry hot path. At WARN that drops to ~4 B/s. rf2o_params.yaml carries the
+  # exact params the launch file hardcoded (verified identical via `ros2 param
+  # dump`), INCLUDING freq: 10.0 -- so the old hand-patch of the package's launch
+  # file is no longer load-bearing after a container rebuild.
+  /root/rosbg.sh rf2o ros2 run rf2o_laser_odometry rf2o_laser_odometry_node \
+     --ros-args -r __node:=rf2o_laser_odometry \
+     --params-file /root/rf2o_params.yaml --log-level rf2o_laser_odometry:=WARN
+  wait_topic /odom_rf2o 30                    && echo "  [rf2o]     OK (owns odom -> base_link)"
   echo "[stack] starting motor (SmartElex) ."
   /root/rosbg.sh motor python3 /root/l298n_node.py \
      --ros-args -p left_is_a:=false -p max_speed:=0.3 -p max_level:=$MAXLEVEL -p min_level:=$MAXLEVEL -p invert_right:=true -p deadman:=0.0
-  sleep 1
+  wait_log motor 'smart_elex_15d ready' 20    && echo "  [motor]    OK (subscribed to /cmd_vel, power level $MAXLEVEL)"
   echo "[stack] starting foxglove_bridge ..."; /root/rosbg.sh foxglove ros2 launch foxglove_bridge foxglove_bridge_launch.xml num_threads:=2
-  sleep 3
+  # marker is lowercase "Server listening on port" -- the old check grepped
+  # "Listening" and so never once matched.
+  wait_log foxglove 'listening on port' 20    && echo "  [foxglove] OK (ws://<pi-ip>:8765)"
   echo
-  echo "=== readiness ==="
-  grep -m1 "ready" /tmp/motor.log 2>/dev/null && echo "  [motor]  OK (subscribed to /cmd_vel)" || echo "  [motor]  starting..."
-  grep -m1 "ready" /tmp/scan.log 2>/dev/null && echo "  [scan]   OK (LD19 -> fixed 504-beam /scan)" || echo "  [scan]   starting..."
-  grep -m1 "Listening" /tmp/foxglove.log 2>/dev/null >/dev/null && echo "  [foxglove] bridge up" || tail -1 /tmp/foxglove.log 2>/dev/null
-  echo
-  echo "[stack] BASE UP (lidar + scan_normalize + rf2o + motor + foxglove)."
+  echo "[stack] BASE UP in $((SECONDS - t0))s (lidar + scan_normalize + rf2o + motor + foxglove)."
   echo "  next: \`map\` to begin mapping, then \`map save\`, then \`nav\`."
   echo "  Foxglove: ws://<pi-ip>:8765"
 }
@@ -163,9 +204,11 @@ do_map() {
   pkill_slam; sleep 1
   echo "[map] starting slam_toolbox online_sync (owns map->odom) ..."
   /root/rosbg.sh slam ros2 launch slam_toolbox online_sync_launch.py slam_params_file:=$SLAM_YAML use_sim_time:=false
-  sleep 3
-  grep -m1 "Registering sensor" /tmp/slam.log 2>/dev/null && echo "[map] OK -- /map building." \
-    || echo "[map] warming up -- check 'logs slam'."
+  if wait_log slam 'Registering sensor' 30; then
+    echo "[map] OK -- /map building."
+  else
+    echo "[map] slam did not register the sensor -- check 'logs slam'."
+  fi
   echo "  drive around in Foxglove, then run:  map save"
 }
 
@@ -184,7 +227,30 @@ do_mapsave() {
     echo "[map save]        (map->odom->base_link must resolve; slam running + rf2o publishing odom. Fix, then re-run 'map save'.)"
   fi
   echo "[map save] saving map to $MAPS_DIR/$name.{pgm,yaml} ..."
-  timeout 30 ros2 run nav2_map_server map_saver_cli -f "$MAPS_DIR/$name" --occ 0.65 --free 0.25 2>&1 | tail -3
+  # Verify the pgm was ACTUALLY REWRITTEN, by mtime -- not merely that a file exists.
+  # map_saver_cli can fail ("Failed to spin map subscription") and leave the previous
+  # pgm/yaml untouched, and the old test here was `[ -f "$name.yaml" ]`, which a stale
+  # file satisfies. The save then carried on, serialized a FRESH pose-graph next to a
+  # 12-minute-old pgm, and printed DONE. That mismatched set is silently corrosive:
+  # slam localizes inside a pose-graph describing one map while map_server feeds the
+  # costmaps a different one, so the rover's pose and its obstacles disagree by
+  # however much the room changed between the two saves.
+  PGM_BEFORE=$(stat -c %Y "$MAPS_DIR/$name.pgm" 2>/dev/null || echo 0)
+  MAP_OK=0
+  for attempt in 1 2 3; do
+    timeout 30 ros2 run nav2_map_server map_saver_cli -f "$MAPS_DIR/$name" --occ 0.65 --free 0.25 2>&1 | tail -3
+    PGM_AFTER=$(stat -c %Y "$MAPS_DIR/$name.pgm" 2>/dev/null || echo 0)
+    if [ "$PGM_AFTER" != "$PGM_BEFORE" ]; then MAP_OK=1; break; fi
+    echo "[map save] map_saver wrote no new pgm (attempt $attempt/3); retrying in 3 s ..."
+    sleep 3
+  done
+  if [ "$MAP_OK" != 1 ]; then
+    echo "[map save] ERROR: map_saver never wrote a new $name.pgm -- the .pgm/.yaml on disk are STALE."
+    echo "[map save]        NOT serializing the pose-graph: a fresh posegraph beside a stale pgm"
+    echo "[map save]        makes nav localize in a map the costmaps never see."
+    echo "[map save]        Check /map is publishing ('ros2 topic hz /map'), then re-run 'map save'."
+    exit 1
+  fi
   if [ -f "$MAPS_DIR/$name.yaml" ]; then
     echo "[map save] serializing slam pose-graph (for slam localization mode) ..."
     if timeout 20 ros2 service call /slam_toolbox/serialize_map slam_toolbox/srv/SerializePoseGraph \
@@ -197,11 +263,9 @@ do_mapsave() {
     echo "[map save] DONE."
     echo "  eyeball:  $MAPS_DIR/$name.pgm   (or /map in Foxglove)"
     echo "  return:   nav ${name}"
-    echo
-    echo "[map save] === MAP QUALITY GRADE ==="
-    python3 /root/grade_map.py "$name" 2>/dev/null
-    rc=$?
-    [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ] && echo "[map save] (grader unavailable -- is python3-numpy installed?)"
+    # NOTE: the auto map-quality grade was removed here (Aug 12). Its verdicts were
+    # not accurate enough to act on -- judge the map in Foxglove instead. The tool
+    # still exists if you want it by hand:  python3 /root/grade_map.py <name>
     if [ "$SEED_FAIL" = 1 ]; then
       echo "[map save] WARNING: map saved but NO seed (seed capture failed) -- nav will use global localization only."
       echo "[map save]          Fix the TF and re-run 'map save' to get a proper seed."
@@ -233,13 +297,15 @@ do_nav() {
   sed -i "s|map_file_name: .*|map_file_name: $MAPS_DIR/$name|" "$SLAM_LOC_YAML"
   /root/rosbg.sh slam_loc ros2 run slam_toolbox localization_slam_toolbox_node \
       --ros-args --params-file "$SLAM_LOC_YAML" -r /map:=/slam_loc_map
+  # was: sleep 3 -- slam_loc must DESERIALIZE the pose-graph (~18 MB) before it
+  # can accept the /initialpose reseed publishes, and that is not a fixed cost.
+  wait_log slam_loc 'Registering sensor' 40
   # NOTE: -r /map:=/slam_loc_map REMAPS slam's posegraph-derived /map away --
   # slam_loc publishes its own occupancy grid (cropped to the traveled area, so the
   # map origin can fall in UNKNOWN space) and map_server publishes the full saved
   # pgm. With both on /map the global costmap saw two conflicting maps and the
   # planner failed to reach (0,0) ("failed to create plan ... tolerance 0.50").
   # map_server is now the ONLY /map owner; slam_loc only owns map->odom.
-  sleep 3
   echo "[nav] scan-match re-seeding slam localization (consistency gate) ..."
   if ! python3 /root/reseed.py --map-name "$name"; then
     echo "[nav] ABORT: could not establish a lidar-consistent pose (see reseed output)."
@@ -251,7 +317,7 @@ do_nav() {
     echo "[nav] slam localization never published map->odom -- check 'logs slam_loc'."; pkill_slam; exit 1; fi
   echo "[nav] bringing up map_server (static /map for costmaps) ..."
   /root/rosbg.sh nav2_map ros2 run nav2_map_server map_server --ros-args -p yaml_filename:=$MAPS_DIR/$name.yaml
-  sleep 2
+  wait_node /map_server 20        # was: sleep 2 -- the lifecycle calls below fail silently if it isn't up yet
   timeout 6 ros2 lifecycle set /map_server configure >/dev/null 2>&1
   timeout 6 ros2 lifecycle set /map_server activate >/dev/null 2>&1
   echo "[nav] bringing up Nav2 navigation stack (no amcl) ..."

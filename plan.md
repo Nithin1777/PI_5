@@ -504,3 +504,109 @@ The nav stack (rf2o, AMCL, Nav2, motor node) is **sound**. The failures were cau
 - This room is ~5–7 m; expect ~1–3 min of systematic driving (perimeter loop + a crossing pass through the middle), not ~20 s.
 
 > **State of the map after this session:** the last `map save` graded **READY** (93×93, 98% free, 1 component, seed↔goal connected) — but it was a *smaller* freshly-built map than the earlier 7×7.7 m attempt. End-to-end nav against a full-room READY map has **not** been re-demonstrated since the lidar remount; re-map the full room and confirm a READY grade before relying on `nav`.
+
+
+
+
+BUG FOUNG AND FIXED:
+
+ I found it, and I can prove it without touching anything. It's not the map — it's reseed.py. Every nav run starts the rover believing it is 0.4 m (or more) away from where it actually is.
+
+
+The bug
+
+
+reseed.py builds the localization seed by scan-matching the live /scan against the saved .pgm. Its cost function converts a beam endpoint to a pixel row using ymax, the map's top edge:
+
+
+ymax = oy + h * res                      # line 80  — true top edge
+
+
+def cost(x, y, yaw):                     # line 112
+
+    ...
+
+    row = int(round((ymax - (y + r*math.sin(th))) / res))   # uses ymax
+
+
+xmin, xmax = ox + 0.4, ox + w * res - 0.4
+
+ymin, ymax = oy + 0.4, oy + h * res - 0.4    # line 126 — REUSES the name `ymax`
+
+                                             #            as a search bound
+
+for x in np.arange(...):                     # line 128 — every cost() call is AFTER this
+
+
+Line 126 overwrites ymax with a value 0.4 m smaller, and cost() resolves ymax at call time — so every single cost evaluation in the search maps beam endpoints onto a map shifted 0.4 m in y. Algebraically cost_buggy(x, y, yaw) == cost_true(x, y + 0.4, yaw), so the minimizer returns y − 0.4 m.
+
+
+Proof, on your actual map
+
+
+I downloaded /root/maps/room.{pgm,yaml,seed}, raycast an ideal 504-beam scan from the ground-truth pose in room.seed, and ran reseed.py's exact search twice:
+
+
+┌──────────────────────────┬───────────────────────┬────────┬───────────────┐
+
+│                          │     reported pose     │  cost  │     error     │
+
+├──────────────────────────┼───────────────────────┼────────┼───────────────┤
+
+│ ground truth (room.seed) │ (0.947, −0.401, 1.6°) │ —      │ —             │
+
+├──────────────────────────┼───────────────────────┼────────┼───────────────┤
+
+│ reseed as written        │ (0.950, −0.800, 2.0°) │ 0.0145 │ dy = −0.399 m │
+
+├──────────────────────────┼───────────────────────┼────────┼───────────────┤
+
+│ reseed with ymax fixed   │ (0.950, −0.400, 2.0°) │ 0.0145 │ dy = +0.001 m │
+
+└──────────────────────────┴───────────────────────┴────────┴───────────────┘
+
+
+Note the costs are identical. The bug is a coordinate shift, not a bad match — so the confidence gate (cost > 0.12 → abort) can never catch it. It reports a beautiful 0.014 m match and hands Nav2 a pose that is 0.4 m wrong. That's why every "the gate passed, localization is confirmed" message you've seen has been lying to you.
+
+
+It matches your last real run exactly
+
+
+/tmp/slam_loc.log (Aug 11, 17:24) — reseed seeded slam at (−0.10, −1.02, θ=0.02). room.seed, captured 40 seconds earlier at map save, says the rover was at (0.95, −0.40, θ=0.028). The rover never moved between those two events.
+
+
+- yaw: identical (0.02 vs 0.028) — the match is angularly perfect
+
+- position: 1.22 m off
+
+
+Right yaw, wrong position is the signature of a coordinate-indexing bug, not of a genuine ambiguity or a bad map. On real data the 0.4 m shift also pushed the search into a neighbouring basin, which is why the live error is 1.2 m rather than exactly 0.4 m.
+
+
+Why that makes nav look "random"
+
+
+1. Localization is wrong by ~1.2 m, and slam_toolbox localization cannot recover it: correlation_search_space_dimension: 0.5 gives it a ±0.25 m search window, and minimum_travel_distance: 0.5 means it only re-matches after half a metre of driving. The wrong map→odom is permanent for the run.
+
+2. Both costmaps have an obstacle_layer fed by /scan. With the pose 1.2 m off, the live scan stamps the room's real walls into the costmap 1.2 m away from where the static map has them — you get a double set of walls, and the corridor between the rover and the origin closes up.
+
+3. NavFn then does what /tmp/nav.log shows: failed to create plan with tolerance 0.50 → Planning algorithm GridBased failed to generate a valid path to (0.00, 0.00) × 14, followed by Running backup, Running spin, Running wait. What you see as "the rover moving randomly" is the behavior tree running recovery behaviours — Nav2 never had a path at all. It never once reached the controller with a valid plan.
+
+4. And the recoveries physically move the rover, which makes the already-wrong pose worse.
+
+
+At the pose reseed believed (−0.10, −1.02), the nearest mapped wall is 0.15 m — inside the footprint's inscribed radius, with inflation_radius: 0.50. Nav2 thought it was starting inside a wall. At the true pose it had 0.20 m, and the goal (0,0) has 0.50 m clearance and is in the same free component as the seed — the map was plannable. You were right: this was never a map problem.
+
+
+Also of note: Planner loop missed its desired rate of 5.0 Hz. Current loop rate is 0.52 Hz — NavFn is taking ~2 s per attempt on a 108×87 grid, which should be milliseconds. That's a separate CPU-starvation issue worth looking at after this, but it isn't what's breaking navigation.
+
+
+The fix is one line
+
+
+Rename the search bound at reseed.py:126 so it stops clobbering the map's top edge:
+
+
+ysearch_min, ysearch_max = oy + 0.4, oy + h * res - 0.4
+
+…and use ysearch_min/ysearch_max in the for y in np.arange(...) loop on line 129. cost() and the coverage check then see the true ymax from line 80. 

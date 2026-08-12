@@ -201,8 +201,17 @@ local_costmap:
       plugins: ["obstacle_layer", "inflation_layer"]
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 2.5
-        inflation_radius: 0.50
+        cost_scaling_factor: 3.0     # steeper decay so the gradient still pushes the
+                                     # rover off walls despite the smaller radius
+        inflation_radius: 0.25       # was 0.50 = 3.5x the footprint's 0.14 m inscribed
+                                     # radius. Fine in an open room, fatal here: measured
+                                     # on room.pgm, 0.50 left the largest connected
+                                     # traversable region at 0.21 m2 -- a 46 cm square,
+                                     # smaller than the 34x28 cm rover -- so NavFn
+                                     # correctly refused every plan ("failed to create
+                                     # plan with tolerance 0.50" x14) and Nav2 fell
+                                     # through to spin/backup recoveries. 0.25 gives 4x
+                                     # the free space. Keep >= the 0.14 inscribed radius.
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
@@ -222,7 +231,13 @@ local_costmap:
 global_costmap:
   global_costmap:
     ros__parameters:
-      update_frequency: 0.5        # was 1.0 -- static map + obstacles; plan rate doesn't need 1Hz
+      update_frequency: 2.0        # planner_server BLOCKS until the costmap is current, so this
+                                   # sets the worst-case stall per plan attempt (1/freq). At 0.5 Hz
+                                   # every replan after a recovery costmap-clear cost up to 2.0 s
+                                   # ("Planner loop missed its desired rate ... 0.5176 Hz" -- each
+                                   # slow plan started within ms of a "clear entirely the
+                                   # global_costmap"). Updating is cheap on a ~9k-cell grid; it was
+                                   # publish_frequency that burned the CPU, so only that stays low.
       publish_frequency: 0.2        # was 1.0 -- visualization-only; foxglove bridge was at 100% CPU streaming this
       global_frame: map
       robot_base_frame: base_link
@@ -250,8 +265,10 @@ global_costmap:
           obstacle_min_range: 0.0
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 2.5
-        inflation_radius: 0.50
+        cost_scaling_factor: 3.0     # keep in step with local_costmap -- if the two
+        inflation_radius: 0.25       # disagree the controller fights the planner.
+                                     # See the local_costmap note above for why 0.50
+                                     # made this map unplannable.
       always_send_full_costmap: True
 
 map_server:

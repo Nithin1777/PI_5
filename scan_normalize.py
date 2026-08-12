@@ -89,10 +89,35 @@ class ScanNormalizer(Node):
         best_range = [float("inf")] * n
         best_intensity = [float("nan")] * n
 
+        # The output grid is CENTRED ON ZERO: bin i is the bearing -pi + i*inc.
+        #
+        # It used to run 0 .. 2*pi, which is mathematically the same set of bearings
+        # and is read correctly by anything that does `angle_min + i*angle_increment`
+        # (slam_toolbox, the nav2 costmaps, reseed.py). rf2o does NOT do that. From
+        # rf2o's CLaserOdometry2D.cpp:
+        #     fovh = std::abs(scan.angle_max - scan.angle_min);          // line 71
+        #     const float tita = -0.5*fovh + float(u)*fovh/float(cols-1); // 441,544,626,667,821
+        # It ignores angle_min completely and ASSUMES the scan is centred on the
+        # laser's +x axis. With angle_min=0/angle_max=2pi it placed beam 0 at -pi
+        # when that beam really points at 0, i.e. it rotated the entire scan by 180
+        # deg -- so every odometry estimate came out rotated 180 deg, inverting both
+        # x and y. Measured on the bench with one 1.0 s forward pulse:
+        #     map scan-match (no rf2o): dx = +0.260 m   <- rover moved FORWARD
+        #     lidar front/rear cones  :                 <- rover moved FORWARD
+        #     rf2o odometry           : dx = -0.226 m   <- reported BACKWARD
+        # Nav2 therefore drove forward, was told it had gone backward, and corrected
+        # by driving further -- and slam had to fight an odometry prior pointing the
+        # wrong way on every update, which is what smeared and speckled the maps.
+        #
+        # angle_max is set to angle_min + (n-1)*inc rather than +pi so that rf2o's
+        # fovh/(cols-1) works out to EXACTLY inc, making its beam bearings identical
+        # to ours instead of off by one bin. As a bonus this makes
+        # round((angle_max-angle_min)/inc)+1 == n, which is the beam count karto
+        # checks (the "expected 504" complaint this node was written to silence).
         angle = msg.angle_min
         for i, r in enumerate(msg.ranges):
             if r == r and r > self.body_mask:         # skip NaN/invalid + own body
-                idx = int(round(angle / inc)) % n     # bin this measurement
+                idx = int(round((angle + math.pi) / inc)) % n   # bin, zero-centred
                 if r < best_range[idx]:
                     best_range[idx] = r
                     best_intensity[idx] = msg.intensities[i] if i < len(msg.intensities) else float("nan")
@@ -100,8 +125,8 @@ class ScanNormalizer(Node):
 
         out = LaserScan()
         out.header = msg.header
-        out.angle_min = 0.0
-        out.angle_max = TWO_PI
+        out.angle_min = -math.pi
+        out.angle_max = -math.pi + (n - 1) * inc
         out.angle_increment = inc
         out.time_increment = msg.scan_time / n if msg.scan_time > 0 and n > 1 else 0.0
         out.scan_time = msg.scan_time

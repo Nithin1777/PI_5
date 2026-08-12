@@ -32,12 +32,26 @@ def main():
     rclpy.init()
     node = rclpy.create_node('tf_pose')
     buf = Buffer()
-    TransformListener(buf, node)
+    # spin_thread=True is LOAD-BEARING, not a tidy-up.
+    #
+    # The buffer is filled only by this listener's /tf and /tf_static subscription
+    # callbacks, which need the node spinning. This used to be spin_thread=False
+    # with a rclpy.spin_once() call on THIS thread followed by the *blocking* form
+    # of lookup_transform (timeout=2 s). That deadlocks: the lookup sleeps waiting
+    # for buffer data that can only arrive from a spin, and the spin cannot run
+    # until the lookup returns. Every attempt burned the full 20 s and reported
+    # "no transform map -> base_link", so 'map save' NEVER captured a localization
+    # seed -- issue.md's recurring "could not capture pose", which looked like a
+    # TF/slam fault but reproduced 100% while `ros2 run tf2_ros tf2_echo map
+    # base_link` resolved instantly on the very same TF tree.
+    #
+    # With spin_thread=True the listener owns a SingleThreadedExecutor on its own
+    # thread, so the buffer fills while the main thread blocks in the lookup.
+    tfl = TransformListener(buf, node, spin_thread=True)
 
     pose = None
     deadline = time.time() + 20.0                 # up to ~20 s, retrying
     while time.time() < deadline:
-        rclpy.spin_once(node, timeout_sec=0.1)
         try:
             # blocking lookup with 2 s timeout: absorbs a transient map->odom
             # blip (slam_loc/rf2o under load) instead of failing 'map save'
@@ -49,8 +63,16 @@ def main():
             pose = (x, y, yaw)
             break
         except Exception:
-            pass
+            time.sleep(0.1)
 
+    # Stop the listener's executor and join its (non-daemon) thread BEFORE
+    # rclpy.shutdown(), or spin() raises out of that thread and dumps a traceback
+    # onto stderr after the pose has already been printed.
+    try:
+        tfl.executor.shutdown()
+        tfl.dedicated_listener_thread.join(timeout=2.0)
+    except Exception:
+        pass
     node.destroy_node()
     rclpy.shutdown()
 

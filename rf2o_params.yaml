@@ -1,0 +1,27 @@
+# rf2o_params.yaml -- parameters for rf2o_laser_odometry, byte-for-byte the same
+# set the package's own rf2o_laser_odometry.launch.py hardcodes.
+#
+# WHY THIS FILE EXISTS: `ros2 launch` cannot forward `--ros-args --log-level` to a
+# node, and rf2o logs 3 INFO lines PER SCAN (execution time / Laser odom /
+# Robot-base odom) at 10 Hz -- measured 3.8 KB/s into /tmp/rf2o.log (~330 MB/day,
+# unrotated) plus the string-format + write cost inside the odometry hot path.
+# stack.sh therefore starts rf2o with `ros2 run ... --params-file <this file>
+# --log-level rf2o_laser_odometry:=WARN` instead of the launch file.
+#
+# BONUS: `freq: 10.0` lives here now, so the old hand-patch of the package's
+# launch file (freq 20.0 -> 10.0, which had to be re-applied after any container
+# rebuild) is no longer load-bearing for the stack.
+#
+# The node is started with `-r __node:=rf2o_laser_odometry` so this namespace and
+# the --log-level target both match.
+rf2o_laser_odometry:
+  ros__parameters:
+    laser_scan_topic: /scan
+    odom_topic: /odom_rf2o
+    publish_tf: true
+    base_frame_id: base_link
+    odom_frame_id: odom
+    init_pose_from_topic: ""     # MUST stay empty -- non-empty makes rf2o wait for
+                                 # an external ground-truth pose topic before starting
+    freq: 10.0                   # must match /scan (10 Hz) or rf2o logs "Waiting for
+                                 # laser_scans" on every other tick
