@@ -1,0 +1,152 @@
+# Rover — command reference
+
+SLAM stack (lidar-only, Phase 1) on the Pi 5, running in Docker container `rover_ros2`.
+Nodes: LD19 lidar → `rf2o` (laser odometry) → `slam_toolbox` → `foxglove_bridge`.
+
+---
+
+## Access
+
+```bash
+ssh nithin@10.7.12.41          # password: 6238764749
+```
+
+Container `rover_ros2` (image `rover_ros2:saved`) auto-starts on boot (`--restart unless-stopped`).
+To get a raw shell inside it:
+
+```bash
+docker exec -it rover_ros2 bash
+```
+
+---
+
+## Daily use — the `~/rover` wrapper (preferred)
+
+After SSH'ing to the Pi, run **one command**. No need to open multiple terminals —
+every node launches detached with its own log file.
+
+| Command | Action |
+|---|---|
+| `~/rover start` | Bring up lidar → rf2o → slam → foxglove (in order, fixes baked in). Prints a health summary. |
+| `~/rover stop` | Tear down the whole stack. |
+| `~/rover restart` | stop, then start. |
+| `~/rover status` | Processes, ros2 nodes, `/scan` rate, `/map` size, `map→base_laser` TF. |
+| `~/rover logs slam` | Tail that node's log live (Ctrl-C to exit). Nodes: `lidar` `rf2o` `slam` `foxglove`. |
+
+```bash
+ssh nithin@10.7.12.41
+~/rover start
+~/rover status
+~/rover logs slam     # needs a real terminal (uses docker exec -it)
+~/rover stop
+```
+
+Nodes survive the SSH session closing (launched with `nohup setsid`), so you can also
+fire-and-forget from your laptop:
+
+```bash
+ssh nithin@10.7.12.41 '~/rover start'
+```
+
+Log files (inside the container): `/tmp/{lidar,rf2o,slam,foxglove}.log`.
+
+---
+
+## Under the hood — raw launch commands
+
+Only needed if you want to run a node manually instead of via the wrapper.
+From inside the container (`docker exec -it rover_ros2 bash`):
+
+```bash
+source /opt/ros/humble/setup.bash && source ~/ros2_ws/install/setup.bash
+
+# 1. lidar (+ base_link -> base_laser static TF, z=0.18)
+ros2 launch ldlidar_stl_ros2 ld19.launch.py
+
+# 2. laser scan-matching odometry (owns odom -> base_link)
+ros2 launch rf2o_laser_odometry rf2o_laser_odometry.launch.py
+
+# 3. SLAM  -- two non-default flags are MANDATORY (see Troubleshooting)
+ros2 launch slam_toolbox online_sync_launch.py \
+  slam_params_file:=/root/slam.yaml use_sim_time:=false
+
+# 4. web viz bridge
+ros2 launch foxglove_bridge foxglove_bridge_launch.xml
+```
+
+Create `/root/slam.yaml` once (overrides `base_frame`, which defaults to `base_footprint`):
+
+```bash
+cp /opt/ros/humble/share/slam_toolbox/config/mapper_params_online_sync.yaml /root/slam.yaml
+sed -i 's/base_frame: base_footprint/base_frame: base_link/' /root/slam.yaml
+```
+
+---
+
+## View the map — Foxglove
+
+`~/rover start`, then on your laptop open [Foxglove Studio](https://foxglove.dev)
+and connect to:
+
+```
+ws://10.7.12.41:8765
+```
+
+Add panels: **Map** (`/map`) and **LaserScan** (`/scan`). Drive the rover around — the
+map fills in. Avoid spinning in place too fast (rf2o is differential scan-matching).
+
+---
+
+## Save the map
+
+Once you've driven around and the map looks good (inside the container):
+
+```bash
+ros2 run nav2_map_server map_saver_cli -f ~/my_map
+# writes ~/my_map.pgm + ~/my_map.yaml
+```
+
+---
+
+## IMU (MPU6050) — wired, detected, NOT used yet
+
+Sensor is on I2C bus 1, confirmed at address **`0x68`** (`WHO_AM_I` = `0x68` → genuine MPU6050).
+User `nithin` is in the `i2c` group, so you can probe it **without root** and without
+`i2c-tools` installed — using a raw-ioctl Python scan of `/dev/i2c-1`.
+
+⚠️ **Mounted sideways** — for the Phase-2 (EKF yaw-fusion) plan the MPU6050 must be
+**flat, Z-up**, or you must remap axes before the Madgwick filter. Sideways breaks
+calibration and gives the wrong heading axis. Phase 1 (this doc) does not use the IMU.
+
+---
+
+## Quick health checks (inside the container)
+
+```bash
+ros2 topic hz /scan                       # ~10 Hz
+ros2 run tf2_ros tf2_echo odom base_link  # exists (rf2o)
+ros2 run tf2_ros tf2_echo map odom        # exists (slam)
+ros2 topic echo /map --once --field info  # resolution/width/height
+```
+
+The slam log must show `Registering sensor: [...]` and **zero** `Failed to compute odom pose`.
+
+---
+
+## Troubleshooting — the two Phase-1 gotchas
+
+If `/map` stays empty and slam spams **`Failed to compute odom pose`**, it is one of these
+(both are already handled by the `~/rover` wrapper and `/root/slam.yaml`):
+
+1. **`use_sim_time` defaults to `true`** in `online_sync_launch.py` (meant for bag playback).
+   On a real robot with no `/clock`, slam's clock freezes at 0 → every TF lookup fails.
+   Fix: pass `use_sim_time:=false`.
+2. **`base_frame` defaults to `base_footprint`**, but this robot only has `base_link`.
+   Fix: `/root/slam.yaml` with `base_frame: base_link` (one-liner above).
+
+Ruled out: the LD19 "scan-count off-by-one" conformance bug — checked live, does not fire
+on this `ldlidar_stl_ros2` + slam_toolbox combo (0 warnings).
+
+The `ros2 node list` may show a duplicate `/rf2o_laser_odometry` — that's a harmless stale
+DDS graph-cache entry from a prior unclean kill; there is only one real process (verify with
+`ps aux | grep rf2o`). It clears after `~/rover stop`/daemon restart.

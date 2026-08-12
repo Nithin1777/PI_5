@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- no_shm.xml -- FastDDS UDP-only transport profile.
+     Why: the FastDDS shared-memory transport in this container (host networking,
+     many processes) fails its port lock ("Failed init_port fastrtps_port7419:
+     open_and_lock_file failed") and can WEDGE nodes at startup/load spikes --
+     observed freezing rf2o mid-nav-bringup, which starves AMCL of odom->base_link.
+     UDP-only avoids SHM entirely (latency cost is negligible on a LAN/loopback).
+     Applied via FASTRTPS_DEFAULT_PROFILES_FILE=/root/no_shm.xml in stack.sh. -->
+<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <transport_descriptors>
+    <transport_descriptor>
+      <transport_id>udp_only</transport_id>
+      <type>UDPv4</type>
+    </transport_descriptor>
+  </transport_descriptors>
+  <participant profile_name="udp_only_profile" is_default_profile="true">
+    <rtps>
+      <userTransports>
+        <transport_id>udp_only</transport_id>
+      </userTransports>
+      <useBuiltinTransports>false</useBuiltinTransports>
+    </rtps>
+  </participant>
+</profiles>

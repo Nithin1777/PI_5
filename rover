@@ -1,0 +1,13 @@
+#!/bin/bash
+# ~/rover -- manage the rover stack inside the rover_ros2 container (run from the Pi host)
+#   rover start | stop | restart | status | logs <node>
+#   rover map | map save [name] | map stop
+#   rover nav [name] | nav stop
+# After SSH'ing to the Pi, just run:  ~/rover start
+export LC_ALL=C LANG=C          # kill the "setlocale: LC_ALL ... en_US.UTF-8" warnings over SSH
+docker start rover_ros2 >/dev/null 2>&1   # ensure container is up (no-op if already running)
+if [ "${1:-}" = "logs" ]; then
+  exec docker exec -it -e LC_ALL=C rover_ros2 /root/stack.sh "$@"
+else
+  exec docker exec -e LC_ALL=C rover_ros2 /root/stack.sh "$@"
+fi

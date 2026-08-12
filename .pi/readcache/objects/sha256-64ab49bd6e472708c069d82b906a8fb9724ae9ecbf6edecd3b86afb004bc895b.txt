@@ -1,0 +1,91 @@
+#!/bin/bash
+# /root/stack.sh — rover stack manager (runs INSIDE rover_ros2 container)
+# Subcommands: start | stop | restart | status | logs <lidar|rf2o|slam|motor|foxglove>
+source /opt/ros/humble/setup.bash
+source /root/ros2_ws/install/setup.bash 2>/dev/null
+
+SLAM_YAML=/root/slam.yaml
+NAMES=(lidar rf2o slam motor foxglove)
+
+ensure_slam_yaml() {
+  if ! grep -q 'base_frame: base_link' "$SLAM_YAML" 2>/dev/null; then
+    cp /opt/ros/humble/share/slam_toolbox/config/mapper_params_online_sync.yaml "$SLAM_YAML"
+    sed -i 's/base_frame: base_footprint/base_frame: base_link/' "$SLAM_YAML"
+    echo "[stack] created $SLAM_YAML (base_frame=base_link)"
+  fi
+}
+
+pkill_nodes() {
+  pkill -9 -f 'sync_slam_toolbox_node|async_slam_toolbox_node|lifelong_slam' 2>/dev/null
+  pkill -9 -f 'rf2o_laser_odometry_node'       2>/dev/null
+  pkill -9 -f 'ldlidar_stl_ros2_node'          2>/dev/null
+  pkill -9 -f 'static_transform_publisher'     2>/dev/null
+  pkill -9 -f 'l298n_node'                     2>/dev/null
+  pkill -9 -f 'foxglove_bridge'                2>/dev/null
+  pkill -9 -f 'ros2 launch'                    2>/dev/null
+  return 0
+}
+
+do_stop() {
+  for n in "${NAMES[@]}"; do
+    [ -f /tmp/$n.pid ] && kill "$(cat /tmp/$n.pid)" 2>/dev/null
+    rm -f /tmp/$n.pid
+  done
+  pkill_nodes
+  sleep 1
+  echo "[stack] stopped."
+}
+
+do_start() {
+  ensure_slam_yaml
+  do_stop >/dev/null 2>&1
+  sleep 1
+  echo "[stack] starting lidar (LD19) ......"; /root/rosbg.sh lidar    ros2 launch ldlidar_stl_ros2 ld19.launch.py
+  sleep 3
+  echo "[stack] starting rf2o (laser odom) ."; /root/rosbg.sh rf2o     ros2 launch rf2o_laser_odometry rf2o_laser_odometry.launch.py
+  sleep 3
+  echo "[stack] starting slam_toolbox ......"; /root/rosbg.sh slam     ros2 launch slam_toolbox online_sync_launch.py slam_params_file:=$SLAM_YAML use_sim_time:=false
+  sleep 2
+  echo "[stack] starting motor (l298n) ....."; /root/rosbg.sh motor    python3 /root/l298n_node.py
+  sleep 1
+  echo "[stack] starting foxglove_bridge (num_threads=4) ..."; /root/rosbg.sh foxglove ros2 launch foxglove_bridge foxglove_bridge_launch.xml num_threads:=4
+  sleep 3
+  echo
+  echo "=== readiness (from logs) ==="
+  grep -m1 "Registering sensor" /tmp/slam.log  2>/dev/null && echo "  [slam]   OK (laser registered -> /map building)"   || echo "  [slam]   warming up..."
+  grep -m1 "ready"            /tmp/motor.log 2>/dev/null && echo "  [motor]  OK (subscribed to /cmd_vel)"               || echo "  [motor]  starting..."
+  grep -m1 "Listening"        /tmp/foxglove.log 2>/dev/null >/dev/null && echo "  [foxglove] bridge up" || tail -1 /tmp/foxglove.log 2>/dev/null
+  echo
+  echo "[stack] UP.  Foxglove: ws://<pi-ip>:8765  -> add Map (/map) + Teleop (/cmd_vel)."
+}
+
+do_status() {
+  echo "=== processes ==="
+  ps -eo pid,args | grep -iE 'ldlidar_stl_ros2_node|rf2o_laser_odometry_node|sync_slam_toolbox_node|l298n_node|foxglove_bridge' \
+                  | grep -v grep | sed 's/ --ros-args.*//' | cut -c1-95
+  echo
+  echo "=== ros2 nodes ==="
+  timeout 8 ros2 node list 2>/dev/null | sort
+  echo
+  printf "/scan: "; timeout 4 ros2 topic hz /scan 2>&1 | grep -m1 'average rate' || echo "(no rate)"
+  printf "/map : "; timeout 7 ros2 topic echo /map --once --field info 2>/dev/null \
+          | grep -E 'resolution|width|height' | tr '\n' ' '; echo
+  echo "TF map -> base_laser:"
+  timeout 5 ros2 run tf2_ros tf2_echo map base_laser 2>&1 | grep -E 'Translation|degree' | head -2
+}
+
+do_logs() {
+  n="${1:-}"
+  case "$n" in lidar|rf2o|slam|motor|foxglove) ;; *) echo "usage: stack logs <lidar|rf2o|slam|motor|foxglove>"; return 1;; esac
+  [ -f /tmp/$n.log ] || { echo "no log: /tmp/$n.log"; return 1; }
+  tail -n 50 -f /tmp/$n.log
+}
+
+case "${1:-}" in
+  start)   do_start ;;
+  stop)    do_stop ;;
+  restart) do_stop; sleep 2; do_start ;;
+  status)  do_status ;;
+  logs)    shift; do_logs "$@" ;;
+  *) echo "usage: stack {start|stop|restart|status|logs <node>}"; exit 1 ;;
+esac

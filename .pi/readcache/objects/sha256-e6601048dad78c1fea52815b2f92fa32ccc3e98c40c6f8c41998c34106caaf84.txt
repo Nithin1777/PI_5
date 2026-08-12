@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+"""
+l298n_node  --  cmd_vel -> SmartElex 15D motor driver over TTL serial.
+Filename kept as l298n_node.py so /root/stack.sh and the container
+launch line (python3 /root/l298n_node.py) need ZERO changes.
+ROS node name is 'smart_elex_15d'.
+
+Hardware: SmartElex 15D dual-channel DC driver in SERIAL MODE
+(DIP SW1=ON, 115200 baud). The driver enumerates as /dev/ttyACM0
+(its onboard Pico TTL-serial reader). USB powers logic only --
+motors need external 7-22 V on VIN/GND.
+
+Protocol -- 6-char packet written at 115200 baud:
+    * [DIR1] [SPD1] [DIR2] [SPD2] #
+      DIR = '1' forward | '0' reverse
+      SPD = '0'..'9'                (0 = 0 %, 9 = 100 %)
+    Examples: *1919# full fwd   *0909# full rev   *1515# ~55 %
+              *1910# / *1019# differential turn   *1010# STOP
+
+Channel mapping (keeps the old L298N semantics):
+    ch1 = M1+ / M1-   ch2 = M2+ / M2-    (left_is_a=True => ch1 = left)
+
+Speed mapping:
+    max_speed <= 0 (default): legacy L298N behavior -- any nonzero
+        wheel command = FULL power (SPD 9); zero => stop.
+    max_speed  > 0: proportional -- SPD = round(|v|/max_speed*9),
+        clamped 1..9, so max_speed is the cmd_vel speed that = 100%.
+    max_level (default 9): hard cap on SPD (0..9), applied last --
+        e.g. max_level=5 caps every command at ~50 % duty (safe testing).
+
+*** LATENCY MODEL (measured on this exact driver) ***
+The SmartElex 15D accepts ONE serial write every ~2.0 s. A write()
+call blocks until 2.0 s have elapsed since the previous accepted
+write. Isolated writes (>=2 s apart) return in <1 ms; a write sooner
+than 2 s after the last blocks for the remainder (up to 2 s). This is
+the device firmware, identical on the Pi host and inside the container.
+
+To keep /cmd_vel responsive despite that, this node:
+  * does NOT re-send on a timer (no refresh spam) -- the SmartElex
+    latches motor state, so a command persists until changed. (The old
+    2.5 s refresh was what kept the device busy and made on-change
+    writes block ~2 s.)
+  * runs all serial I/O on a dedicated WRITER THREAD. The 20 Hz control
+    loop only computes the desired packet; the writer thread does the
+    (possibly 2 s-blocking) write. So a new /cmd_vel is always heard and
+    acted on immediately; the motor applies it as soon as the device's
+    2 s window opens (instant if the device has been idle >=2 s).
+
+Behavior notes:
+    * WATCHDOG (deadman) -- if no /cmd_vel is received for `deadman` seconds
+      (default 2.0), the node forces a STOP. Prevents runaway if Nav2 / teleop
+      dies. Set deadman:=0 to disable (legacy: last command persists forever).
+    * Stop command (v=w=0) sends *1010#.
+    * Port is reopened with a 1 s backoff if it disappears
+      (the Pico re-enumerates on reset / Pi reboot).
+"""
+import threading
+import time
+
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import Twist
+
+try:
+    import serial
+except ImportError:
+    raise SystemExit(
+        "pyserial is not installed -- in the rover_ros2 container run:\n"
+        "    apt update && apt install -y python3-serial")
+
+DZ = 1e-3               # deadzone (ignore tiny float noise)
+STOP_PACKET = "*1010#"  # emergency stop / standby
+RETRY_PERIOD = 1.0      # s between serial reopen attempts
+WRITE_POLL_HZ = 50.0    # how often the writer thread checks for a pending packet
+
+
+class SmartElex15D(Node):
+    def __init__(self):
+        super().__init__('smart_elex_15d')
+        self.port         = self.declare_parameter('port', '/dev/ttyACM0').value
+        self.baudrate     = self.declare_parameter('baudrate', 115200).value
+        self.track_width  = self.declare_parameter('track_width', 0.15).value
+        self.left_is_a    = self.declare_parameter('left_is_a', True).value
+        self.invert_left  = self.declare_parameter('invert_left', False).value
+        self.invert_right = self.declare_parameter('invert_right', False).value
+        self.max_speed    = self.declare_parameter('max_speed', 0.0).value
+        self.max_level    = int(self.declare_parameter('max_level', 9).value)
+        self.deadman      = float(self.declare_parameter('deadman', 2.0).value)  # watchdog stop (s); 0 = off
+        ctrl_hz = max(float(self.declare_parameter('ctrl_hz', 20.0).value), 1.0)
+
+        # Shared state (protected by _lock).
+        self._lock = threading.Lock()
+        self.v = 0.0
+        self.w = 0.0
+        self._last_cmd = 0.0          # monotonic time of last /cmd_vel (0 = never -> watchdog stops)
+        self._desired = STOP_PACKET   # latest packet the control loop wants sent
+        self._written = None          # last packet actually accepted by the device
+
+        # Serial port is owned EXCLUSIVELY by the writer thread.
+        self.ser = None
+        self._ser_err = None          # last open error string (dedupe logs)
+        self._last_open = 0.0         # monotonic time of last open attempt
+
+        self._running = True
+        self._writer = threading.Thread(target=self._writer_loop, daemon=True)
+
+        self.create_subscription(Twist, '/cmd_vel', self.on_cmd, 10)
+        self.create_timer(1.0 / ctrl_hz, self.tick)
+
+        self._writer.start()
+        self.get_logger().info(
+            f"smart_elex_15d ready: {self.port} @ {self.baudrate} "
+            f"track={self.track_width:.3f} left_is_a={self.left_is_a} "
+            f"invL={self.invert_left} invR={self.invert_right} "
+            f"max_speed={self.max_speed} max_level={self.max_level} "
+            f"deadman={self.deadman} "
+            f"(writer-thread serial; no refresh; ~2s device window)")
+
+    # ---------- cmd_vel ----------
+    def on_cmd(self, msg):
+        with self._lock:
+            self.v = msg.linear.x
+            self.w = msg.angular.z
+            self._last_cmd = time.monotonic()
+
+    # ---------- control loop (never blocks on serial) ----------
+    def tick(self):
+        now = time.monotonic()
+        with self._lock:
+            v, w = self.v, self.w
+            stale = (self.deadman > 0.0) and ((self._last_cmd == 0.0) or (now - self._last_cmd > self.deadman))
+        if stale:                      # watchdog: force STOP if no /cmd_vel for `deadman` seconds
+            v, w = 0.0, 0.0
+        vL = v - w * self.track_width / 2.0
+        vR = v + w * self.track_width / 2.0
+        if self.left_is_a:
+            d1, s1 = self._chan(vL, self.invert_left)    # ch1 = left
+            d2, s2 = self._chan(vR, self.invert_right)   # ch2 = right
+        else:
+            d1, s1 = self._chan(vR, self.invert_right)
+            d2, s2 = self._chan(vL, self.invert_left)
+        packet = f"*{d1}{s1}{d2}{s2}#"
+        with self._lock:
+            self._desired = packet       # writer thread picks it up
+
+    # ---------- writer thread (owns the serial port) ----------
+    def _writer_loop(self):
+        poll = 1.0 / WRITE_POLL_HZ
+        while self._running:
+            if self.ser is None:
+                self._open_port()
+            if self.ser is not None:
+                with self._lock:
+                    desired = self._desired
+                    written = self._written
+                if desired != written:          # only write on real change (no refresh)
+                    if self._send(desired):     # may block up to ~2 s (device window)
+                        with self._lock:
+                            self._written = desired
+            time.sleep(poll)
+
+    def _chan(self, speed, invert):
+        """One channel: return (dir_char '1'/'0', speed_char '0'..'9')."""
+        if invert:
+            speed = -speed
+        if abs(speed) <= DZ:
+            return '1', '0'   # stopped channel = dir 1, spd 0 (matches doc: *1010#)
+        d = '1' if speed > 0.0 else '0'
+        if self.max_speed <= 0.0:
+            s = 9                     # legacy: full power
+        else:
+            s = int(round(min(abs(speed) / self.max_speed, 1.0) * 9.0))
+            s = max(1, min(9, s))
+        s = min(s, self.max_level)    # hard cap (max_level=5 -> ~50% duty)
+        return d, str(s)
+
+    # ---------- serial ----------
+    def _open_port(self):
+        now = time.monotonic()
+        if now - self._last_open < RETRY_PERIOD:
+            return
+        self._last_open = now
+        try:
+            self.ser = serial.Serial(
+                self.port, self.baudrate, timeout=0.1, write_timeout=2.0)
+            self.ser.reset_input_buffer()
+            time.sleep(2.0)   # driver needs ~2 s after open to init USB (per 15D doc)
+            self._ser_err = None
+            with self._lock:
+                self._written = None   # force resend of current cmd after reopen
+            self.get_logger().info(f"serial port {self.port} open")
+            return True
+        except Exception as e:
+            self.ser = None
+            if str(e) != self._ser_err:
+                self._ser_err = str(e)
+                self.get_logger().warn(f"serial open failed ({self.port}): {e}")
+            return False
+
+    def _send(self, packet):
+        if self.ser is None:
+            return False
+        try:
+            self.ser.write(packet.encode('ascii'))
+            self.ser.flush()
+            return True
+        except Exception as e:
+            self.get_logger().warn(f"serial write failed ({packet!r}): {e}")
+            self._close_port()
+            return False
+
+    def _close_port(self):
+        try:
+            if self.ser is not None:
+                self.ser.close()
+        except Exception:
+            pass
+        self.ser = None
+
+    def destroy_node(self):
+        self._running = False
+        try:
+            self._writer.join(timeout=3.0)   # let the in-flight write finish
+        except Exception:
+            pass
+        try:
+            if self.ser is not None:          # final STOP, then release (writer is done)
+                self._send(STOP_PACKET)
+                self._close_port()
+        except Exception as e:
+            self.get_logger().warn(f"shutdown error: {e}")
+        return super().destroy_node()
+
+def main():
+    rclpy.init()
+    node = SmartElex15D()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    node.destroy_node()
+    rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()

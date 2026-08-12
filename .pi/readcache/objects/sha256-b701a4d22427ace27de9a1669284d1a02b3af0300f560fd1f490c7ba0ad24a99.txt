@@ -1,0 +1,428 @@
+USEFUL COMMANDS:
+
+root@nithin:/# ros2 launch ldlidar_stl_ros2 ld19.launch.py
+docker exec -it rover_ros2 bash
+root@nithin:/# ros2 launch slam_toolbox online_sync_launch.py
+nithin@nithin:~ $ docker start rover_ros2
+rover_ros2
+nithin@nithin:~ $ docker exec -it rover_ros2 bash
+docker exec -it rover_ros2 bash
+ros2 launch foxglove_bridge foxglove_bridge_launch.xml
+
+
+SSH COMMANDS:
+ssh nithin@10.7.12.41
+password:6238764749
+
+WIRING — PI5 to motor driver: SmartElex 15D (SERIAL, not GPIO)
+The L298N GPIO driver is RETIRED. The rover now uses the SmartElex 15D dual-channel
+DC driver in TTL/USB SERIAL MODE — no Pi GPIO pins drive the motors anymore.
+
+Connection: SmartElex 15D USB  ->  /dev/ttyACM0  (onboard Pico TTL-serial reader)
+Board setup: DIP switch = position 8 (SW1=ON)  ->  serial mode @ 115200 baud
+Power:       USB powers LOGIC ONLY. Motors need external 7-22 V on VIN/GND screw terminals.
+Motors:      ch1 = M1+/M1-   ch2 = M2+/M2-   (left_is_a=False on this build -> ch1 = right)
+Protocol:    6-char packet at 115200:  * [DIR1][SPD1][DIR2][SPD2] #
+             DIR 1=fwd / 0=rev,  SPD 0..9 (0=0%, 9=100%).  e.g. *1919# full fwd, *1010# STOP
+ROS node:    /root/l298n_node.py  (class SmartElex15D, node name `smart_elex_15d`)
+             consumes /cmd_vel -> /dev/ttyACM0. Launched by stack.sh as the `motor` node.
+Live params: left_is_a=False, max_level=5 (caps every command at ~50% duty for safe testing).
+Full board guide: smart_elex_15D.md
+
+
+
+
+
+
+
+
+
+
+
+# Plan: Lidar-only SLAM (no wheel encoders) on the Rover
+
+**Hardware:** Raspberry Pi 5 · LDROBOT LD19 lidar (`base_laser`, ~10 Hz) · SmartElex 15D motor driver (USB serial, `/dev/ttyACM0`) · no wheel encoders · no IMU in the loop
+**Stack:** ROS 2 Humble, all running inside Docker container `rover_ros2`
+**Goal:** Get `slam_toolbox` to actually build `/map` by providing the missing `odom → base_link` transform using **lidar scan-matching odometry** (rf2o). The original plan also fused an MPU6050 yaw via an EKF as "Phase 2" — that has been **dropped** (see STATUS).
+
+---
+
+## STATUS — what's done (updated Aug 2026)
+
+- 🆕 **Phase 3 — Autonomous navigation (return-to-origin) ✅ WORKING (Aug 2026).** Map the room → `~/rover nav` → AMCL localizes against the saved `.pgm` and `return_home.py` drives the rover back to the **map origin `(0,0,0)`** (= the drop point). Demonstrated live end-to-end. New verbs: `start`(base) `map` `map save` `nav` `nav stop` `speed`. Speed is a **single power level** (`rover speed N`, default 3; floor=ceiling) so turns have enough torque in **both** teleop and nav. A string of non-obvious bugs were fixed along the way (AMCL seed QoS, AMCL lifecycle race, motor power floor, locale, …) — catalogued in §5b.6. ⚠️ The LD19 was found **mounted 180° backwards** (caused a wrong-way drive) — remount forward and re-map. See §5b.
+- ✅ **Phase 1 = the architecture.** Lidar-only SLAM is the final, in-use design. `rf2o` owns `odom → base_link`, `slam_toolbox` owns `map → odom`, `/map` builds. Verified live on the Pi.
+- ✅ **Motor driver migrated L298N → SmartElex 15D.** Driven over USB serial (`/dev/ttyACM0` @ 115200), no GPIO. Node `smart_elex_15d` (file `/root/l298n_node.py`) verified opening the port and subscribed to `/cmd_vel`. See top wiring note + `smart_elex_15D.md`.
+- ✅ **Stack is managed by `~/rover` (host) → `/root/stack.sh` (container) → `/root/rosbg.sh` (per node).** `start` = base (lidar → rf2o → motor → foxglove); `map` / `nav` layer slam or Nav2 on top. All detached; survives SSH disconnect.
+- ❌ **Phase 2 (MPU6050 + EKF yaw-fusion) DROPPED.** Tried, results were poor: the MPU6050 has **no magnetometer**, so its yaw has no absolute reference and drifts far too fast to help scan-matching — fusing it gave no real benefit over lidar-only. SLAM's own `map → odom` already corrects yaw drift continuously. §5 is kept below as historical/reference only; it is **not** deployed.
+- ⚠️ **LD19 scan-count warning now fires** (contrary to earlier notes): slam logs `LaserRangeScan contains N range recordings, expected 500` (N=501–504). Non-fatal — the map still builds — but slam discards the off-by-one scans. See updated §9.
+- 🔧 **Teleop latency FIXED — root cause was the driver, not Foxglove.** The SmartElex 15D accepts ONE serial write every ~2.0 s (measured: `write()` blocks for exactly `max(0, 2000 − gap)` ms). The old motor node re-sent the command every 2.5 s (`REFRESH_PERIOD`), keeping the device busy, AND blocked its control loop on `write()` → every command stalled up to 2 s. Fix: `l298n_node.py` rewritten — serial I/O on a dedicated **writer thread** (the 20 Hz loop never blocks) + **refresh removed** (the SmartElex latches state). Normal driving (commands >2 s apart) is now responsive; rapid back-to-back commands still hit the ~2 s device floor. (The earlier `num_threads:=4` on `foxglove_bridge` was a wrong turn — v3.4.2 ignores that param.) See §10.
+
+---
+
+## 1. The problem (one paragraph)
+
+`slam_toolbox` matches consecutive laser scans to build a map, but to align scans it must know *roughly how the robot moved between scans*. That motion estimate lives in the `odom → base_link` transform. On this robot there is **no odometry source** (no encoders), so `odom → base_link` is missing → SLAM can't process scans → `/map` stays empty. We synthesize that transform two ways: (a) **laser scan-matching** with `rf2o_laser_odometry` (already built in the workspace) produces odometry from the lidar itself, and (b) the **MPU6050's yaw** is fused in through `robot_localization`'s EKF to stabilize rotation. The reference implementation for this exact constraint (Pi + no encoders + lidar + IMU) is `Lochan25526/ros2-lidar-inertial-slam`. **(Update Aug 2026: half (b) — the MPU6050/EKF yaw fusion — was DROPPED after poor results; only the lidar scan-matching (a) is deployed. See STATUS.)**
+
+### TF tree we are building
+```
+map ──> odom ──> base_link ──> base_laser   (lidar)
+                   │
+                   └──> imu_link            (MPU6050) — NOT deployed (Phase 2 dropped)
+```
+| Transform | Owner |
+|---|---|
+| `map → odom` | `slam_toolbox` |
+| `odom → base_link` | **rf2o** (final — EKF dropped) |
+| `base_link → base_laser` | static TF — ✅ already exists (z = 0.180) |
+| `base_link → imu_link` | static TF — **not added** (Phase 2 dropped) |
+
+---
+
+## 2. Current state (verified on the Pi)
+
+- ✅ **Device issue permanently fixed.** Container recreated with `-v /dev:/dev` + `--privileged` + `--restart unless-stopped`; image saved as `rover_ros2:saved`. Survives USB replugs and Pi reboots. (Live confirm: `--privileged`, `--network host`, `-v /dev:/dev`.)
+- ✅ **Phase 1 stack running & verified:** `/LD19`, `/rf2o_laser_odometry`, `/slam_toolbox` (`sync_slam_toolbox_node`), `/foxglove_bridge`, static `base_link → base_laser` (z=0.180), plus the **`smart_elex_15d`** motor node.
+- ✅ `/scan`: ~10 Hz, real ranges, frame `base_laser`.
+- ✅ `/map`: **building** — slam logs `Registering sensor: [Custom Described Lidar]`; the `map → odom → base_link → base_laser` TF chain resolves.
+- ✅ `odom → base_link` owned by **rf2o** (`publish_tf=True`). Verified live: rf2o emitted real odometry (`Robot-base odom [x,y,yaw]=...`) while tracking.
+- ✅ **Motor: SmartElex 15D over `/dev/ttyACM0` @ 115200.** `/tmp/motor.log` shows `serial port /dev/ttyACM0 open` + `smart_elex_15d ready` (launched with `left_is_a=False`, `max_level=5`).
+- ✅ Already installed: `robot_localization`, `imu_filter_madgwick`, `rf2o_laser_odometry` (in `/root/ros2_ws`). (The first two are now UNUSED — Phase 2 dropped.)
+- ❌ **MPU6050 fusion dropped** — see STATUS. IMU was detected on `i2c-1` @ `0x68` but is mounted sideways and is **not** in the loop.
+- ⚠️ slam emits LD19 scan-count warnings (`expected 500`) — see §9.
+- rf2o launch defaults: `odom_topic=/odom_rf2o`, `base_frame_id=base_link`, `odom_frame_id=odom`, `laser_scan_topic=/scan`, `publish_tf=True`.
+
+---
+
+## 3. Architecture (final — lidar only)
+
+The original plan proposed two phases; **Phase 2 (IMU/EKF) was dropped** (see STATUS). The deployed architecture is lidar-only — `rf2o` owns `odom → base_link`, `slam_toolbox` owns `map → odom`. The motor node sits outside the TF chain (it just consumes `/cmd_vel`).
+
+```
+LD19 ──/scan──┬─→ rf2o ──/odom_rf2o──→ owns odom→base_link
+              │        │
+              │   slam_toolbox ──/map   (owns map→odom)
+              └─→ slam_toolbox
+
+smart_elex_15d :  /cmd_vel ──→ /dev/ttyACM0  (SmartElex 15D, outside TF chain)
+```
+
+---
+
+## 4. Phase 1 — Lidar-only odometry → building map (no IMU needed)
+
+> ✅ **PHASE 1 VERIFIED WORKING (2026-08-01)** — lidar-only odometry builds `/map`. Two non-default slam settings are mandatory; see §4.2.
+
+rf2o already defaults to publishing `odom → base_link`, so this is mostly just launching it and restarting slam.
+
+**4.1 Launch rf2o** (in a new container shell):
+```bash
+docker exec -it rover_ros2 bash
+# inside:
+source /opt/ros/humble/setup.bash && source ~/ros2_ws/install/setup.bash
+ros2 launch rf2o_laser_odometry rf2o_laser_odometry.launch.py
+# params are already: odom_topic=/odom_rf2o, base_frame_id=base_link, publish_tf=true
+```
+
+**4.2 Launch slam_toolbox** (now that `odom → base_link` exists). **Two non-default settings are mandatory** on this robot — the stock launch will NOT build a map without them (see "Phase-1 gotchas" below):
+```bash
+# (a) create a params file overriding base_frame (default is base_footprint; we only have base_link)
+docker exec rover_ros2 bash -c \
+  'cp /opt/ros/humble/share/slam_toolbox/config/mapper_params_online_sync.yaml /root/slam.yaml && \
+   sed -i "s/base_frame: base_footprint/base_frame: base_link/" /root/slam.yaml'
+
+# (b) launch with that params file AND use_sim_time:=false
+ros2 launch slam_toolbox online_sync_launch.py \
+  slam_params_file:=/root/slam.yaml use_sim_time:=false
+```
+
+> **Phase-1 gotchas (both hit for real):**
+> - **`use_sim_time` defaults to `true`** in `online_sync_launch.py` (it's meant for bag playback). On a real robot with no `/clock`, slam's clock is frozen at 0, so it can never resolve `odom→base_link` at the scan timestamp → it spams `Failed to compute odom pose` forever and `/map` never fills. Always pass `use_sim_time:=false`.
+> - **`base_frame` defaults to `base_footprint`**, but this robot's tree only has `base_link`. Every `odom→base_footprint` lookup fails with the identical `Failed to compute odom pose` warning. Override it via `/root/slam.yaml` as above.
+> - ⚠️ **The LD19 "scan-count off-by-one" conformance bug DOES fire now** — see §9. Non-fatal (map still builds); recorded for awareness (earlier it was wrongly logged as not firing).
+
+**4.3 Verify:**
+```bash
+ros2 topic echo /odom_rf2o --once          # rf2o publishing odom
+ros2 run tf2_ros tf2_echo odom base_link   # NOW EXISTS  ✅
+ros2 run tf2_ros tf2_echo map odom         # slam_toolbox publishing  ✅
+ros2 topic echo /map --once --field info   # shows resolution/width/height → map exists ✅
+ros2 topic hz /map                         # ~0.2 Hz (slam updates every ~5 s) — fine
+# slam log MUST show "Registering sensor: [...]" and ZERO "Failed to compute odom pose"
+```
+Then **drive the robot** around the room — `/map` fills in. Open `/map` + `/scan` in Foxglove (connect `ws://10.7.12.41:8765`).
+
+**Phase-1 limitations (accepted):** yaw drifts over time (no absolute heading); scan-matching degrades in long featureless corridors. (Phase 2 was meant to address the yaw part but was dropped — see §5; SLAM's own `map → odom` already corrects yaw drift continuously.)
+
+---
+
+## 5. Phase 2 — Add MPU6050 + fuse yaw via EKF   ❌ DROPPED
+
+> **⛔ DROPPED (Aug 2026).** This phase was attempted and abandoned. The MPU6050 has **no magnetometer**, so its yaw has no absolute heading reference and drifts far too quickly to stabilize scan-matching — fusing it via the EKF produced **no improvement over lidar-only**, while adding TF-jitter and calibration headaches (the sensor was also mounted sideways). SLAM's own `map → odom` already corrects yaw drift continuously, so the EKF gave no net benefit. **rf2o keeps `publish_tf=True` and owns `odom → base_link`.** Everything below is kept as historical reference only — do not redeploy without a 9-DoF IMU (with magnetometer).
+
+### 5.1 Wire the MPU6050 (Pi 5 GPIO)
+| MPU6050 | Pi 5 pin |
+|---|---|
+| VCC | 3.3V (pin 1) |
+| GND | GND (pin 9) |
+| SDA | GPIO2 / SDA (pin 3) |
+| SCL | GPIO3 / SCL (pin 5) |
+
+### 5.2 Install i2c-tools + confirm the sensor
+```bash
+docker exec rover_ros2 bash -c "apt update && apt install -y i2c-tools"
+docker exec rover_ros2 i2cdetect -y 1          # expect 0x68 to show up
+```
+(If `0x68` doesn't appear, re-check wiring / `dtparam=i2c_arm=on` in `/boot/firmware/config.txt`.)
+
+### 5.3 Add a MPU6050 ROS 2 driver
+Clone one of these into `/root/ros2_ws/src` and `colcon build`:
+- `https://github.com/hiwad-aziz/ros2_mpu6050_driver` (publishes `sensor_msgs/Imu`, auto-calibration)
+- `https://github.com/DavDori/mpu6050_ros2`
+
+```bash
+docker exec -it rover_ros2 bash
+cd ~/ros2_ws/src && git clone https://github.com/hiwad-aziz/ros2_mpu6050_driver
+cd ~/ros2_ws && colcon build --symlink-install --packages-select ros2_mpu6050_driver
+```
+Run it → publishes raw IMU. **Calibration note:** most of these auto-calibrate on startup — the sensor must be **flat, Z-up, and stationary** when the node starts.
+
+### 5.4 Orientation filter (gives a fused quaternion)
+The MPU6050 driver gives raw accel + gyro. Feed it to `imu_filter_madgwick` to get a stable orientation:
+```bash
+ros2 run imu_filter_madgwick imu_filter_madgwick_node \
+  --ros-args -p use_mag:=false -p publish_tf:=false \
+  -p stateless:=false
+# (remap input to the driver's raw topic, output is /imu/data)
+```
+`use_mag:=false` is required — the MPU6050 has **no magnetometer**, so yaw has no absolute reference (it drifts; SLAM corrects it via `map → odom`).
+
+### 5.5 Turn rf2o's TF off (EKF will own `odom → base_link`)
+The repo's key lesson: two nodes publishing `odom → base_link` makes TF jitter. Edit the rf2o launch (or pass as arg) to `publish_tf:=false`. rf2o then publishes **only** `/odom_rf2o` (a topic), which the EKF consumes.
+
+### 5.6 EKF config — save as `~/ros2_ws/ekf.yaml`
+```yaml
+ekf_filter_node:
+  ros__parameters:
+    frequency: 30.0
+    sensor_timeout: 0.1
+    two_d_mode: true
+    publish_tf: true            # EKF owns odom -> base_link
+    map_frame: map
+    odom_frame: odom
+    base_link_frame: base_link
+    world_frame: odom
+
+    odom0: /odom_rf2o
+    #            X     Y     Z    roll  pitch  yaw   vX   vY   vZ  vroll vpitch vyaw   aX aY aZ
+    odom0_config: [true, true, false,
+                   false, false, true,
+                   true, true, false,
+                   false, false, true,
+                   false, false, false]
+
+    imu0: /imu/data
+    imu0_config: [false, false, false,
+                  false, false, true,   # yaw
+                  false, false, false,
+                  false, false, true,   # yaw rate
+                  false, false, false]
+    imu0_remove_gravitational_acceleration: false
+```
+**The IMU contributes yaw + yaw-rate only** — that's all an MPU6050 (no magnetometer) is good for. Linear acceleration is unused because double-integration drifts hopelessly.
+
+### 5.7 Launch the EKF
+```bash
+ros2 run robot_localization ekf_node --ros-args --params-file ~/ros2_ws/ekf.yaml
+```
+
+### 5.8 Add the `imu_link` static transform
+```bash
+# replace x/y/z with the actual IMU mounting offset from base_link
+ros2 run tf2_ros static_transform_publisher x y z 0 0 0 base_link imu_link
+```
+
+### 5.9 Verify Phase 2
+```bash
+ros2 topic hz /imu/data
+ros2 run tf2_ros tf2_echo odom base_link      # now published by EKF, smooth
+ros2 topic echo /odometry/filtered --once
+ros2 topic hz /map
+```
+Rotate the robot in place — the laser ring should rotate smoothly with minimal jitter (the EKF's whole point).
+
+---
+
+## 5b. Phase 3 — Autonomous navigation (return-to-origin)  ✅ WORKING
+
+> ✅ **Working (Aug 2026).** Return-to-origin demonstrated live: map the room → `~/rover nav` → the rover localizes (AMCL) and drives back to the **map origin `(0,0,0)`** (= the drop point). Single goal-to-origin in a pre-mapped room (not exploration), tuned for the SmartElex's ~2 s serial floor. A string of non-obvious bugs were hit & fixed during bring-up — catalogued in §5b.6 so they don't have to be re-discovered.
+
+### 5b.1 What "origin" means
+`slam_toolbox` starts the robot at map `(0,0,0)` when mapping begins, so the **drop point A *is* the map origin**. `map save` captures the pose at the stop point **B** (the localization seed); `nav` navigates from B back to `(0,0,0) = A`. No markers, no measuring — the goal is hardcoded as the origin.
+
+### 5b.2 Architecture (navigation mode)
+The base (lidar, rf2o, motor, foxglove) stays up across both phases. Only the **owner of `map→odom`** changes:
+
+```
+MAPPING:     map→odom owned by slam_toolbox     (/map = live, growing)
+NAVIGATION:  map→odom owned by AMCL             (/map = static pgm from map_server)
+```
+
+`odom→base_link` is owned by **rf2o throughout** (never stopped → continuous across the swap). Nav2's `velocity_smoother` is the last hop of the command chain — `controller_server → /cmd_vel_nav → velocity_smoother → /cmd_vel → smart_elex_15d` — so the motor node needs **zero remapping**.
+
+```
+LD19 ──/scan──┬─→ rf2o ──/odom_rf2o──→ owns odom→base_link
+              ├─→ AMCL ───────────────→ owns map→odom   (localized vs saved pgm)
+              └─→ Nav2 (planner/controller/costmaps) ──/cmd_vel──→ smart_elex_15d
+map_server :  /root/maps/room.yaml ──→ /map (static, feeds the global costmap)
+```
+
+### 5b.3 Files (`~/pi5` repo → container `/root/`)
+| File | Role |
+|---|---|
+| `stack.sh` | verbs `start`(base) `map` `map save` `map stop` `nav` `nav stop` `speed` `status` `logs`; `nav` force-activates AMCL then runs return_home; kills publish a STOP first |
+| `nav2_params.yaml` | Nav2 + AMCL: `base_link`, odom from `/odom_rf2o`, DWB, footprint 310×245 mm, `deadband_velocity`, `velocity_smoother` |
+| `return_home.py` | seeds AMCL (dedicated node, TRANSIENT_LOCAL, republished continuously) → `waitUntilNav2Active` → `goToPose(0,0,0)`; cancels the goal on any exit |
+| `tf_pose.py` | captures `map→base_link` → localization seed file |
+| `seed_amcl.py` | standalone AMCL re-seeder (diagnostic) |
+| `stop_cmd.py` | publishes zero `/cmd_vel` so the motor latches STOP when nav is killed (deadman is off) |
+| `l298n_node.py` | + `min_level`/`max_level` power floor/ceiling + `deadman` watchdog + writer-thread serial (§10) |
+
+### 5b.4 Run it (return-to-origin demo)
+```bash
+~/rover start          # base: lidar + rf2o + motor + foxglove
+~/rover speed          # show power level (default 3)
+~/rover map            # slam online_sync — drive the room in Foxglove (walking pace)
+~/rover map save       # -> /root/maps/room.{pgm,yaml} + room.seed
+~/rover nav            # AMCL + Nav2 up, returns to origin (0,0,0)
+~/rover nav stop       # tear down nav (base stays); reliably stops the motor
+~/rover stop           # kill everything
+```
+Drop the rover at A **before** `map` (so the origin lands on A). Don't maneuver it between `map save` and `nav` (the seed must match the real pose).
+
+### 5b.5 Speed / power model (important)
+The SmartElex has 9 discrete duty levels (0–9); the motor node maps `cmd_vel` → level. Key lesson: **turning produces small per-wheel speeds** (track is only 0.15 m) that used to map to level 1 = twitch — not enough torque to turn, in **both** teleop and nav.
+- `rover speed N` sets a **single power level** = `min_level = max_level = N` (default **3**). Every motion — forward, reverse, turn, teleop *and* nav — runs at level N.
+- Raise it (`rover speed 4`, `5`) for stronger turns / more speed; lower it (`2`) if the wheels slip. The trade-off is inherent to 9-level hardware: more level = more turn power but more slip on each abrupt kick.
+- Tuning only the ceiling (`max_level`) does **not** fix weak turns — weak commands sit at the floor. That's why `speed` sets both to one value.
+
+### 5b.6 Bugs hit & fixed during bring-up (the painful list)
+1. **AMCL seed rejected — QoS.** `BasicNavigator.setInitialPose()` publishes `/initialpose` with a QoS AMCL rejects (`incompatible QoS … DURABILITY`) → seed never arrived → nav drove blind into a wall. Fix: `return_home.py` publishes `/initialpose` from a **dedicated node** with `TRANSIENT_LOCAL` QoS (Humble imports: `QoSReliabilityPolicy` / `QoSDurabilityPolicy` — *not* `Reliability`/`Durability`, which don't exist).
+2. **AMCL left `inactive` — lifecycle race.** Intermittently `lifecycle_manager_localization` logs `amcl/get_state … async_send_request failed` → `Aborting bringup` → AMCL stays inactive → rejects the seed (`Received initial pose request, but AMCL is not yet in the active state`). Fix: `do_nav` → `ensure_amcl_active` polls and force-activates AMCL (`ros2 lifecycle set /amcl activate`); `return_home.py` republishes the seed every 0.4 s for 30 s so it's accepted the moment AMCL goes active.
+3. **`return_home.py` crashed** formatting `estimated_time_remaining` (a `Duration`, not a float) → on crash Nav2 kept the goal → runaway. Fix: format `.sec`; `try/finally` cancels the goal on any exit.
+4. **`deadman:=0` crashed the motor node** — INTEGER vs DOUBLE param type. Fix: `deadman:=0.0` (float).
+5. **`deadman=0` (kept for latched teleop) broke `nav stop`** — killing Nav2 leaves no `/cmd_vel`, so the motor held its last command → runaway. Fix: `pkill_nav` runs `stop_cmd.py` to publish zero `/cmd_vel` *after* killing the nodes, so the motor latches STOP. (Goal cancel/complete is separately safe via the smoother's `velocity_timeout`.)
+6. **Turns too weak** — small per-wheel speeds → level 1 → twitch. Fix: `min_level` floor, then the single power level (§5b.5).
+7. **Locale spam** (`setlocale: LC_ALL en_US.UTF-8`) — `locale-gen en_US.UTF-8` (host + container) + `export LC_ALL=C` in `~/.bashrc`, `stack.sh`, `~/rover`.
+8. **`use_composition:=False`** must be capital F (the launch evaluates it as Python); lowercase `false` → `name 'false' is not defined`. (`use_sim_time:=false` lowercase is fine.)
+9. **`map_saver_cli -o`** isn't a valid flag in this build — removed.
+10. **`base_frame: base_link`** everywhere (AMCL + both costmaps), not `base_footprint` — same trap as Phase 1.
+11. **odom topic is `/odom_rf2o`**, not `/odom` — set on `bt_navigator` + `velocity_smoother`.
+12. **⚠️ Lidar mounted 180° backwards** → the map/heading was flipped → nav drove the *wrong way* ("full throttle opposite direction"). **Not a code bug** — remount the LD19 facing the bot's forward and re-map (the old map is stale).
+
+### 5b.7 The 2 s serial floor, revisited for autonomy
+Nav2's controller publishes `/cmd_vel` at ~10 Hz. With the motor bang-bang at level N, `velocity_smoother.deadband_velocity: [0.05, 0, 0.15]` zeroes micro-jitter so the motor's change-detection writes only on real changes (the SmartElex latches + accepts one write per ~2 s). `xy_goal_tolerance: 0.4` absorbs the ~2 s stop overshoot. Residual: back-to-back commands within 2 s still serialize — eliminating it entirely needs switching the SmartElex to **PWM/RC mode** (future, §10).
+
+### 5b.8 Limitations (accepted for the demo)
+- Single return-to-origin goal (no exploration / multi-goal).
+- Stop precision ~0.4 m (by design — "relatively close" is fine).
+- 9-level bang-bang motion is jerky and can slip; tune N.
+- Assumes a static, feature-rich room; rf2o yaw drift is corrected continuously by AMCL's `map→odom`.
+- `left_is_a:=false` channel mapping assumed from Phase-1 wiring — verify teleop L/R first; flip to `true` if it turns the wrong way.
+- AMCL can still flip ~180° in a highly symmetric room even when seeded; keep the rover still between `map save` and `nav`.
+
+---
+
+## 6. slam_toolbox params (optional tuning)
+
+The default `online_sync_launch.py` works once odom exists. If mapping is rough, drop a `slam.yaml` (from the reference repo, trimmed) and pass it:
+```yaml
+slam_toolbox:
+  ros__parameters:
+    odom_frame: odom
+    map_frame: map
+    base_frame: base_link
+    scan_topic: /scan
+    mode: mapping
+    resolution: 0.05
+    minimum_travel_distance: 0.05
+    minimum_travel_heading: 0.05
+    use_scan_matching: true
+    use_scan_barycenter: true
+    scan_buffer_maximum_scan_distance: 10.0   # LD19 maxes at 25m; cap for indoor
+```
+```bash
+ros2 launch slam_toolbox online_sync_launch.py slam_params_file:=~/ros2_ws/slam.yaml
+```
+
+---
+
+## 7. Rollback / safety
+
+- The working container image is saved as `rover_ros2:saved` (Up 2 days, `--privileged --network host -v /dev:/dev`). If you break the writable layer, recommit a clean snapshot first: `docker commit rover_ros2 rover_ros2:saved` (the old `phase2_base` name is moot now that Phase 2 is dropped).
+- Phase 1 changes nothing destructive — rf2o is already built; you're just launching nodes.
+
+---
+
+## 8. Cheat sheet — what to run, in order
+
+**Phase 1 (today, no IMU):**
+1. `ros2 launch ldlidar_stl_ros2 ld19.launch.py`   → `/scan` (10 Hz) + `base_link→base_laser` static TF
+2. `ros2 launch rf2o_laser_odometry rf2o_laser_odometry.launch.py`  → owns `odom→base_link`
+3. make `/root/slam.yaml` overriding `base_frame: base_link` (one-liner in §4.2)
+4. `ros2 launch slam_toolbox online_sync_launch.py slam_params_file:=/root/slam.yaml use_sim_time:=false`
+5. verify `tf2_echo odom base_link` + `tf2_echo map odom` + slam log shows `Registering sensor` → drive around
+6. motor: `python3 /root/l298n_node.py` (node `smart_elex_15d`) → subscribes `/cmd_vel` → `/dev/ttyACM0` (SmartElex 15D). Use `max_level` to cap speed. Tip: `~/rover start` runs all of the above for you.
+
+**Phase 2 (MPU6050 + EKF):** ❌ **DROPPED** — see STATUS and §5. Do not run these steps; kept for reference only. (Would have required: `i2cdetect -y 1` → `0x68`, an MPU6050 driver, `imu_filter_madgwick`, rf2o `publish_tf:=false`, `ekf_node`, and a `base_link→imu_link` static TF.)
+
+**Phase 3 (autonomous navigation — return-to-origin):** ✅ built.
+1. `~/rover start` → base (lidar + rf2o + motor + foxglove). **Drop the rover at origin point A *before* the next step** (slam starts the robot at map (0,0,0), so A = origin).
+2. `~/rover map` → slam online_sync; drive the room in Foxglove (walking pace).
+3. `~/rover map save` → `/root/maps/room.{pgm,yaml}` + `room.seed` (localization seed).
+4. `~/rover nav` → AMCL + Nav2 up (seeded at B), drives back to origin `(0,0,0) = A`.
+5. `~/rover nav stop` / `~/rover stop` to tear down.  (Details + gotchas: §5b.)
+
+---
+
+## 9. Known limitations (be aware for the demo)
+- **No absolute yaw reference — accepted.** The IMU/EKF fusion (Phase 2) was tried and **dropped**: the MPU6050 has no magnetometer, so fusing its drifting yaw helped nothing. Yaw drift is instead corrected continuously by SLAM's own `map → odom`. For a demo room this is fine.
+- **Laser scan-matching fails in featureless/symmetric spaces** (long empty corridor, circular room). Add visual structure or slow down.
+- **rf2o needs the laser to move** — it's a *differential* odometry; it initializes at the origin and tracks motion. Parked-then-go is fine.
+- ⚠️ **LD19 scan-count conformance bug DOES fire** — earlier notes said it didn't (0 warnings), but live logs now show `LaserRangeScan contains N range recordings, expected 500` (N=501–504), tens of warnings. **Non-fatal**: slam discards the off-by-one scans but the map still builds and `Registering sensor` succeeds. If it ever hurts mapping quality, fix by publishing `[0°,360°)` instead of `[0°,360°]` in the lidar driver.
+
+---
+
+## 10. Teleop latency — real root cause & fix (`/cmd_vel`)
+
+**Symptom:** clicking forward (Foxglove or keyboard teleop) took seconds before the motors moved — "a millennia."
+
+**Wrong turns (for the record):** first blamed a single-threaded `foxglove_bridge` and set `num_threads:=4` in `stack.sh` — but foxglove_bridge **v3.4.2 doesn't declare/consume that param** (`ros2 param get` → "Parameter not set"), so it was a **no-op**. Then suspected the Docker container. Both disproven by direct measurement. (The `num_threads:=4` line is still in `stack.sh` — harmless; can be reverted.)
+
+**Real root cause (measured, deterministic):** the SmartElex 15D's USB-serial interface accepts ONE write every ~2.0 s. A paced test gave a perfect linear fit — `write()` blocks for exactly `max(0, 2000 − gap_since_last_write)` ms:
+
+| gap since last write | write blocks |
+|---|---|
+| 0.0 s | 2010 ms |
+| 0.5 s | 1511 ms |
+| 1.0 s | 1011 ms |
+| 1.5 s | 511 ms |
+| 2.0 s | 11 ms |
+| ≥ 2.5 s | < 1 ms |
+
+Identical on the Pi host and inside the container → it's the **device firmware**, not ROS / Foxglove / Python / Docker / the USB cable. Isolated commands (≥ 2 s apart) are instant; a command sooner than 2 s after the last blocks up to 2 s.
+
+Why Foxglove felt like "millennia": the old motor node (a) **re-sent the current command every 2.5 s** (`REFRESH_PERIOD`) — that kept the device's 2 s window perpetually busy, so an on-change write almost always landed inside it and blocked ~2 s; and (b) it **blocked its 20 Hz control loop on `write()`**, so during that block it couldn't even receive a new `/cmd_vel`.
+
+**Fix applied (Aug 2026) — `l298n_node.py` rewritten (software only; serial mode kept):**
+1. **Removed the refresh spam.** The SmartElex latches motor state, so a command persists until changed — no periodic resend needed. Biggest win: the device is now idle between user commands.
+2. **All serial I/O moved to a dedicated writer thread.** The 20 Hz control loop only computes the desired packet; the writer thread does the (possibly ~2 s-blocking) `write()`. So `/cmd_vel` is always heard and acted on immediately.
+3. Deployed to container `/root/l298n_node.py` (byte-matches the repo); relaunched with `max_level:=5` (50 % safe cap).
+
+**Result:** normal teleop (commands > 2 s apart) is now responsive. The only residual lag is two commands within 2 s (e.g. forward then immediate stop) — the second waits up to 2 s. That ~2 s is the **hardware floor of serial mode**; eliminating it entirely needs switching the SmartElex to **PWM/RC input mode** (DIP change + GPIO PWM wiring + a PWM node) — not done; future option.
+
+**Test harnesses left in place:**
+- `~/drive.py` on the Pi host — standalone SmartElex serial WASD tester (no ROS); prints each write's latency. Keys: `w`/`s`/`a`/`d`, `x`/SPACE stop, `q` quit. Run: `python3 ~/drive.py`.
+- `teleop_twist_keyboard` installed in the container; `~/teleop` wrapper on the host runs it (SSH keyboard teleop, bypasses Foxglove). Keys: `i`/`,`/`j`/`l`, `k` stop.
+- Foxglove (`ws://10.7.12.41:8765`) + `~/rover start` both still drive it.
+
+**How to verify the fix:** drive with commands spaced > 2 s — each should be near-instant. Then forward→stop as fast as possible to feel the 2 s hardware floor.
