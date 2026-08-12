@@ -53,8 +53,23 @@ slam_toolbox:
     # patience exceeded" x15 -> follow_path aborted. That is the premature stop, and
     # the frozen-then-jumping pose is why the goal distance read 0.00 m then 1.82 m.
     # Mapping looked fine because driving by hand covers 0.5 m constantly.
-    minimum_travel_distance: 0.1
-    minimum_travel_heading: 0.1
+    #
+    # Lowered 0.1 -> 0.05 so map->odom is corrected roughly twice as often while the
+    # rover is actually driving. The reason is measured: with 0.1, a short nav run
+    # (~0.3 m with a couple of turns) ended with a heading error almost exactly equal
+    # to the error reseed.py started it with -- 0.4 deg in -> 3.0 deg out, 8.9 deg in
+    # -> 9.0 deg out. slam_loc was contributing no correction over the run, so the seed
+    # error passed straight through to the final pose while Nav2 faithfully drove to
+    # "believed yaw = 0".
+    #
+    # NOT lowered further, deliberately. On a PARKED rover map->odom was once measured
+    # rotating 23 deg over three minutes while map->base_link moved 16 deg -- slam
+    # matching against rf2o's drift and over-correcting. More frequent matching is not
+    # automatically better in a small, feature-poor room; it also injects more of that.
+    # 0.05 is a compromise, and return_home.py's verify-and-correct pass is the actual
+    # safety net rather than this value.
+    minimum_travel_distance: 0.05
+    minimum_travel_heading: 0.05
     scan_buffer_size: 3
     scan_buffer_maximum_scan_distance: 10.0
     link_match_minimum_response_fine: 0.1

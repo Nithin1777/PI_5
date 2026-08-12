@@ -96,6 +96,9 @@ def main():
                     help="reject any candidate pose whose own cell is not mapped-free and at "
                          "least this far (m) from an obstacle. Default 0.14 = the footprint's "
                          "inscribed radius. Pass 0 to disable the check entirely.")
+    ap.add_argument("--yaw-scan", action="store_true",
+                    help="diagnostic: sweep cost vs yaw about the best pose to show how"
+                         " sharply (or not) the map constrains heading")
     ap.add_argument("--no-publish", action="store_true", help="only print the pose, do not publish")
     ap.add_argument("--timeout", type=float, default=10.0, help="seconds to wait for a /scan")
     args = ap.parse_args()
@@ -241,6 +244,39 @@ def main():
     print("[reseed] in-map fit: trimmed mean %.3f m (median %.3f m) over %d of %d beams"
           % (fit, ins[len(ins) // 2] if ins else float("nan"), keep, cov_in))
     print("POSE %.4f %.4f %.4f" % (x0, y0, y0a))
+
+    # ROTATIONAL CONDITIONING. A low cost only means "this pose fits". It says nothing
+    # about whether NEIGHBOURING poses fit just as well -- and if they do, the match is
+    # not actually pinned down, it just happens to have won. Yaw is where that bites on
+    # this rover: a small, roughly rectangular room seen from near its centre looks much
+    # the same rotated a few degrees, so the cost surface can be almost flat in yaw while
+    # being sharp in x/y. Measured on a parked rover, map->odom rotated 23 deg over three
+    # minutes with the robot untouched -- slam_loc sliding along exactly such a flat
+    # direction -- against a yaw_goal_tolerance of 11.5 deg.
+    #
+    # This sweeps yaw about the winner with x/y held at the optimum and reports how far
+    # you must rotate before the cost rises by a meaningful margin. A wide "flat band"
+    # means absolute heading is not observable from this map and no amount of gate
+    # tightening will make it so.
+    if args.yaw_scan:
+        base = cost(x0, y0, y0a)
+        margin = max(0.02, 0.5 * args.threshold)     # "meaningfully worse" than the best
+        print("[reseed] yaw conditioning sweep about the best pose (cost is mean m):")
+        band = []
+        for d in range(-30, 31, 2):
+            c = cost(x0, y0, y0a + math.radians(d))
+            flat = (c - base) < margin
+            if flat:
+                band.append(d)
+            print("           %+4d deg  cost %.4f  %s%s"
+                  % (d, c, "flat" if flat else "", "   <-- best" if d == 0 else ""))
+        if band:
+            print("[reseed] cost stays within %.3f m of the optimum over %+d..%+d deg (%d deg wide)."
+                  % (margin, min(band), max(band), max(band) - min(band)))
+            if (max(band) - min(band)) > 12:
+                print("[reseed]   WARNING: heading is UNDER-CONSTRAINED by this map. The scan match"
+                      " cannot pin yaw tighter than that band, so yaw_goal_tolerance and any"
+                      " heading-dependent behaviour are running on noise.")
 
     sys_err = __import__("sys").stderr
     if coverage < args.min_coverage:

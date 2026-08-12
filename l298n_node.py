@@ -89,6 +89,35 @@ class SmartElex15D(Node):
         self.min_level = int(self.declare_parameter('min_level', 2).value)
         self.deadman   = float(self.declare_parameter('deadman', 2.0).value)  # s; 0 = off
 
+        # --- PROPORTIONAL (continuous-duty) speed model ---
+        # The 0..9 levels are a leftover from SERIAL mode, where speed really was one
+        # digit in the *[D][S][D][S]# packet. In INDEPENDENT PWM mode the board takes a
+        # CONTINUOUS duty: 8 % -> 0 % motor, 94 % -> 100 %, linear (manual p.13). Nothing
+        # requires quantizing to 9 steps, and quantizing costs the thing Nav2 needs most.
+        #
+        # With `speed N` setting min_level == max_level == N, every nonzero wheel command
+        # collapsed to ONE duty (level 1 = 17.6 %), so only the SIGN of /cmd_vel survived.
+        # Measured on the bench: commanding wz=-0.15 and wz=-0.5 rad/s for 0.6 s produced
+        # -51.9 deg and -44.4 deg respectively -- 3.3x less commanded velocity produced
+        # MORE rotation. DWB was asking for gentle heading trims and getting a ~1.4 rad/s
+        # lurch (~10x commanded), so it could never settle inside yaw_goal_tolerance.
+        #
+        # Proportional mode maps the requested fraction of max_speed into the usable duty
+        # band [min_duty, max_duty]:
+        #   min_duty -- the duty at which the drivetrain actually STARTS moving. Below it
+        #               the motors stall and Nav2 would be commanding motion that never
+        #               happens. Must be MEASURED, not assumed; it depends on this
+        #               chassis, and on the tape currently on 4 of the 6 tyres.
+        #   max_duty -- the ceiling, i.e. the old `speed N` knob. Keeping it low is what
+        #               keeps the low-grip tyres controllable.
+        # Both are runtime-settable (`ros2 param set`) so the deadband can be swept
+        # without restarting the node and losing the GPIO.
+        self.proportional = bool(self.declare_parameter('proportional', True).value)
+        self.min_duty = float(self.declare_parameter('min_duty', PWM_MIN).value)
+        max_duty_p = float(self.declare_parameter('max_duty', 0.0).value)
+        self.max_duty = max_duty_p if max_duty_p > 0.0 else self._level_to_duty(self.max_level)
+        self.add_on_set_parameters_callback(self._on_set_params)
+
         ctrl_hz = max(float(self.declare_parameter('ctrl_hz', 20.0).value), 1.0)
 
         # --- gpiozero devices ---
@@ -116,7 +145,9 @@ class SmartElex15D(Node):
             f"track={self.track_width:.3f} left_is_a={self.left_is_a} "
             f"invL={self.invert_left} invR={self.invert_right} "
             f"max_speed={self.max_speed} max_level={self.max_level} "
-            f"min_level={self.min_level} deadman={self.deadman} "
+            f"min_level={self.min_level} "
+            f"{'PROPORTIONAL duty %.3f..%.3f' % (self.min_duty, self.max_duty) if self.proportional else 'QUANTIZED levels'} "
+            f"deadman={self.deadman} "
             f"(~0.1 ms writes, no 2 s serial floor)")
 
     # ---------- cmd_vel ----------
@@ -143,6 +174,25 @@ class SmartElex15D(Node):
             m2_dir, m2_duty = self._chan(vL, self.invert_left)    # M2 = left
         self._apply(m1_dir, m1_duty, m2_dir, m2_duty)
 
+    # ---------- runtime parameter updates ----------
+    def _on_set_params(self, params):
+        """Allow min_duty/max_duty/proportional to be retuned live.
+
+        Calibrating the deadband means trying a dozen duties; restarting the node for
+        each one tears down and re-grabs the GPIO, which is both slow and a good way to
+        leave a motor latched mid-sweep. Clamped to the board's legal 8..94 % window.
+        """
+        from rcl_interfaces.msg import SetParametersResult
+        for p in params:
+            if p.name == 'min_duty':
+                self.min_duty = max(0.0, min(float(p.value), PWM_MAX))
+            elif p.name == 'max_duty':
+                self.max_duty = max(0.0, min(float(p.value), PWM_MAX))
+            elif p.name == 'proportional':
+                self.proportional = bool(p.value)
+        self._last = (None, None, None, None)      # force a rewrite on the next tick
+        return SetParametersResult(successful=True)
+
     # ---------- per-channel: (dir_high, duty) ----------
     def _chan(self, speed, invert):
         """Return (dir_high: bool, duty: float 0..PWM_MAX). Stopped -> (True, 0.0)."""
@@ -151,6 +201,13 @@ class SmartElex15D(Node):
         if abs(speed) <= DZ:
             return True, 0.0                       # stopped: duty 0 (dir don't-care)
         dir_high = speed > 0.0
+        if self.proportional and self.max_speed > 0.0:
+            # continuous duty: |wheel speed| as a fraction of full scale, mapped into
+            # the usable band. frac is clamped, NOT wrapped -- an over-range command
+            # saturates at max_duty rather than folding back to a small duty.
+            frac = min(abs(speed) / self.max_speed, 1.0)
+            lo, hi = self.min_duty, max(self.max_duty, self.min_duty)
+            return dir_high, lo + frac * (hi - lo)
         if self.max_speed <= 0.0:
             lvl = 9                                # legacy: full power
         else:

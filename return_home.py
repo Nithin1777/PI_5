@@ -21,11 +21,12 @@ Run via:  ~/rover nav
 import argparse
 import math
 import os
+import subprocess
 import sys
 import time
 
 import rclpy
-from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist
 from lifecycle_msgs.msg import State
 from lifecycle_msgs.srv import GetState
 from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
@@ -108,7 +109,116 @@ def parse_args():
     ap.add_argument('--no-amcl', action='store_true',
                     help='slam_toolbox localization mode: skip AMCL seeding/confirmation '
                          '(reseed.py already published /initialpose; stack.sh verified map->odom)')
+    ap.add_argument('--verify-attempts', type=int, default=2,
+                    help='after Nav2 reports success, re-localize against the saved map and '
+                         're-drive if the TRUE pose is outside tolerance (0 disables)')
+    ap.add_argument('--xy-tol', type=float, default=0.15,
+                    help='accept-position tolerance for the verify pass '
+                         '(match xy_goal_tolerance in nav2_params.yaml)')
+    ap.add_argument('--yaw-tol', type=float, default=0.20,
+                    help='accept-heading tolerance in rad for the verify pass '
+                         '(match yaw_goal_tolerance in nav2_params.yaml)')
     return ap.parse_args()
+
+
+def absolute_pose(map_name, publish=True):
+    """Scan-match the CURRENT lidar frame against the saved map -> (x, y, yaw) or None.
+
+    Runs reseed.py, which is deliberately independent of the running localization: it
+    matches the live scan against the saved .pgm from scratch. That independence is the
+    entire point. Verifying with map->base_link would consult the very estimate that is
+    suspected of being wrong, and would happily confirm a pose that is 22 deg off -- the
+    exact failure this pass exists to catch. Measured across four runs, the final heading
+    error tracked reseed's INITIAL yaw error almost one-for-one (0.4 deg in -> 3.0 out,
+    8.9 -> 9.0), because slam_loc contributes no correction over a short run; Nav2 drives
+    to "believed yaw = 0" and the belief is offset by exactly the seed error.
+
+    With publish=True reseed also republishes /initialpose, so a bad belief is CORRECTED
+    here, not merely detected -- which is what makes a second attempt worth anything.
+    """
+    cmd = [sys.executable, '/root/reseed.py', '--map-name', map_name]
+    if not publish:
+        cmd.append('--no-publish')
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=120).stdout
+    except Exception as e:
+        print(f"[return_home] verify: reseed failed to run ({e})", file=sys.stderr)
+        return None
+    for line in out.splitlines():
+        if line.startswith('POSE '):
+            try:
+                x, y, yaw = (float(v) for v in line.split()[1:4])
+                return (x, y, yaw)
+            except Exception:
+                return None
+    print("[return_home] verify: reseed produced no POSE line (gate failed?)", file=sys.stderr)
+    return None
+
+
+def wrap(a):
+    return (a + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def pose_error(pose, gx, gy, gyaw):
+    """(distance_m, |heading error| rad) of `pose` from the goal."""
+    dxy = math.hypot(pose[0] - gx, pose[1] - gy)
+    dyaw = abs(wrap(pose[2] - gyaw))
+    return dxy, dyaw
+
+
+# Fastest yaw rate this chassis has been measured doing at the lowest usable duty.
+# Used to size trim pulses so they UNDERSHOOT: assuming the fast end means the pulse is
+# too short whenever the rover happens to respond slowly, which is the safe direction.
+TRIM_ASSUMED_RATE = 1.5      # rad/s
+TRIM_W = 0.2                 # commanded yaw rate for trim pulses (lowest usable duty)
+TRIM_UNDERSHOOT = 0.5        # fraction of the "ideal" duration to actually apply
+
+
+def trim_heading(nav, pub, map_name, goal_yaw, yaw_tol, max_pulses=6):
+    """Close the loop on final heading: measure, nudge, measure again.
+
+    Nav2 cannot do this on its own here. Its heading correction is open-loop within a
+    control cycle, and this chassis's rotation is NOT repeatable -- the same command,
+    at the same duty, was measured producing 0.62 rad/s and 1.42 rad/s on different
+    attempts (2.3x), because 4 of 6 tyres are taped and the skid-steer sticks and then
+    breaks free. Open-loop control of an actuator like that cannot hit an 11.5 deg
+    window: the verify pass previously tried to fix a -21 deg error and landed at
+    +18 deg, bouncing across the goal.
+
+    Measuring between pulses removes the need for repeatability. Each pulse is sized
+    from the FAST end of the observed range and then halved, so it reliably undershoots
+    and the error converges from one side instead of oscillating. Absolute scan-match is
+    used for the measurement -- checking against map->base_link would consult the very
+    estimate that has been wrong.
+
+    Returns the last measured pose, or None if it could not be measured.
+    """
+    pose = None
+    for i in range(1, max_pulses + 1):
+        pose = absolute_pose(map_name, publish=True)
+        if pose is None:
+            return None
+        err = wrap(goal_yaw - pose[2])
+        print(f"[return_home] trim {i}/{max_pulses}: heading off by "
+              f"{math.degrees(err):+.1f} deg")
+        if abs(err) <= yaw_tol:
+            print("[return_home] trim: heading within tolerance.")
+            return pose
+        dur = abs(err) / TRIM_ASSUMED_RATE * TRIM_UNDERSHOOT
+        dur = max(0.06, min(dur, 0.5))       # floor: shorter than this does nothing
+        twist = Twist()
+        twist.angular.z = math.copysign(TRIM_W, err)
+        t0 = time.time()
+        while time.time() - t0 < dur:
+            pub.publish(twist)
+            time.sleep(0.02)
+        stop = Twist()
+        for _ in range(30):                  # latching driver: stop must be insisted on
+            pub.publish(stop)
+            time.sleep(0.02)
+        time.sleep(1.5)                      # let the chassis settle before re-measuring
+    print(f"[return_home] trim: did not converge in {max_pulses} pulses.", file=sys.stderr)
+    return pose
 
 
 def wait_for_bt_navigator_active(nav, timeout=120.0):
@@ -174,33 +284,100 @@ def main():
         print("[return_home] Nav2 active.")
 
         # --- 3. goal (default: map origin = your drop point) ---
-        goal = make_goal(nav, args.x, args.y, args.yaw)
         print(f"[return_home] goal = ({args.x:.2f}, {args.y:.2f}, {args.yaw:.2f}) -- navigating ...")
-        nav.goToPose(goal)
-        goal_sent = True
 
-        # --- monitor ---
-        t0 = time.time()
-        last = None
-        while not nav.isTaskComplete():
-            if time.time() - t0 > args.timeout:
-                print(f"[return_home] TIMEOUT after {args.timeout:.0f}s -- cancelling.",
-                      file=sys.stderr)
-                nav.cancelTask()
-                break
-            fb = nav.getFeedback()
-            if fb is not None:
-                d = fb.distance_remaining
-                if last is None or abs(d - last) > 0.05:
-                    last = d
-                    try:
-                        eta = f"{fb.estimated_time_remaining.sec}s"
-                    except Exception:
-                        eta = "?"
-                    print(f"[return_home] {d:.2f} m to goal (est {eta})")
-            rclpy.spin_once(nav, timeout_sec=0.2)
+        def drive_once():
+            """Send the goal and monitor to completion. Returns a TaskResult."""
+            nonlocal goal_sent
+            goal = make_goal(nav, args.x, args.y, args.yaw)
+            nav.goToPose(goal)
+            goal_sent = True
+            t0 = time.time()
+            last = None
+            while not nav.isTaskComplete():
+                if time.time() - t0 > args.timeout:
+                    print(f"[return_home] TIMEOUT after {args.timeout:.0f}s -- cancelling.",
+                          file=sys.stderr)
+                    nav.cancelTask()
+                    break
+                fb = nav.getFeedback()
+                if fb is not None:
+                    d = fb.distance_remaining
+                    if last is None or abs(d - last) > 0.05:
+                        last = d
+                        try:
+                            eta = f"{fb.estimated_time_remaining.sec}s"
+                        except Exception:
+                            eta = "?"
+                        print(f"[return_home] {d:.2f} m to goal (est {eta})")
+                rclpy.spin_once(nav, timeout_sec=0.2)
+            return nav.getResult()
 
-        result = nav.getResult()
+        trim_pub = nav.create_publisher(Twist, '/cmd_vel', 10)
+        result = drive_once()
+
+        # --- 4. VERIFY AND CORRECT ---
+        # Nav2 reporting SUCCEEDED only means its BELIEF reached the goal. Measured on
+        # this rover: a run finished with `Goal succeeded` while physically sitting
+        # 22.0 deg off (tolerance 11.5), and an earlier one 38 deg off, because the
+        # heading belief was wrong by that much at the instant the goal checker sampled
+        # and converged to the truth only afterwards. So re-localize from scratch and
+        # check the REAL pose. reseed also republishes /initialpose, so a wrong belief is
+        # corrected before the retry -- otherwise the retry would just drive to the same
+        # wrong place again, convinced it was already home.
+        if result == TaskResult.SUCCEEDED and args.verify_attempts > 0:
+            for attempt in range(1, args.verify_attempts + 1):
+                time.sleep(2.0)                 # let the pose settle before measuring
+                pose = absolute_pose(args.map_name, publish=True)
+                if pose is None:
+                    print("[return_home] verify: could not establish a true pose -- "
+                          "reporting Nav2's result unchanged.", file=sys.stderr)
+                    break
+                dxy, dyaw = pose_error(pose, args.x, args.y, args.yaw)
+                print(f"[return_home] verify {attempt}/{args.verify_attempts}: true pose "
+                      f"({pose[0]:.3f}, {pose[1]:.3f}, yaw {math.degrees(pose[2]):.1f} deg) "
+                      f"-> off by {dxy:.3f} m / {math.degrees(dyaw):.1f} deg")
+                if dxy <= args.xy_tol and dyaw <= args.yaw_tol:
+                    print("[return_home] verify: within tolerance.")
+                    break
+
+                # Position and heading are corrected by DIFFERENT mechanisms on purpose.
+                # Re-issuing a Nav2 goal to fix a heading-only error is what made this
+                # oscillate before (-21 deg -> +18 deg): DWB does one open-loop rotation
+                # per cycle, and on this non-repeatable chassis that rotation overshoots.
+                # So Nav2 is used only when the POSITION is actually wrong, and the final
+                # heading is closed-loop trimmed with measured pulses.
+                if dxy > args.xy_tol:
+                    if attempt == args.verify_attempts:
+                        print(f"[return_home] verify: STILL off by {dxy:.3f} m / "
+                              f"{math.degrees(dyaw):.1f} deg after {attempt} attempt(s) -- "
+                              f"giving up rather than driving indefinitely.", file=sys.stderr)
+                        result = TaskResult.FAILED
+                        break
+                    print("[return_home] verify: position outside tolerance -- "
+                          "belief corrected, re-driving ...")
+                    time.sleep(2.0)             # let slam absorb the corrected /initialpose
+                    result = drive_once()
+                    if result != TaskResult.SUCCEEDED:
+                        break
+                    continue
+
+                print("[return_home] verify: position OK, heading off -- trimming ...")
+                pose = trim_heading(nav, trim_pub, args.map_name, args.yaw, args.yaw_tol)
+                if pose is None:
+                    result = TaskResult.FAILED
+                    break
+                dxy, dyaw = pose_error(pose, args.x, args.y, args.yaw)
+                print(f"[return_home] verify: after trim, off by {dxy:.3f} m / "
+                      f"{math.degrees(dyaw):.1f} deg")
+                if dxy <= args.xy_tol and dyaw <= args.yaw_tol:
+                    print("[return_home] verify: within tolerance.")
+                    break
+                if attempt == args.verify_attempts:
+                    print("[return_home] verify: heading trim did not converge.", file=sys.stderr)
+                    result = TaskResult.FAILED
+                    break
+
         if result == TaskResult.SUCCEEDED:
             print("[return_home] ARRIVED at goal. :-)")
             rc = 0

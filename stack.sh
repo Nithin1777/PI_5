@@ -24,7 +24,12 @@ NAV_YAML=/root/nav2_params.yaml
 MAPS_DIR=/root/maps
 BASE_NAMES=(lidar scan rf2o motor foxglove)
 DEFAULT_MAP=room
-MAXLEVEL=$(cat /root/.motor_speed 2>/dev/null || echo 3)   # motor POWER level 1..9 (floor=ceiling); set via 'speed <n>'
+MAXLEVEL=$(cat /root/.motor_speed 2>/dev/null || echo 3)   # motor power CEILING 1..9; set via 'speed <n>'
+# Duty at which the drivetrain actually starts moving. The board is linear from 8 %
+# duty (= 0 % motor) to 94 % (= 100 %), but below some duty this chassis simply stalls,
+# and commanding into that dead zone makes Nav2 think it is moving when it is not.
+# MEASURED on this rover -- re-measure after any change to tyres, load or battery.
+MOTOR_MIN_DUTY=$(cat /root/.motor_min_duty 2>/dev/null || echo 0.10)
 
 # ---------------------------------------------------------------- helpers -----
 ensure_slam_yaml() {
@@ -179,8 +184,9 @@ do_start() {
   wait_topic /odom_rf2o 30                    && echo "  [rf2o]     OK (owns odom -> base_link)"
   echo "[stack] starting motor (SmartElex) ."
   /root/rosbg.sh motor python3 /root/l298n_node.py \
-     --ros-args -p left_is_a:=false -p max_speed:=0.3 -p max_level:=$MAXLEVEL -p min_level:=$MAXLEVEL -p invert_right:=true -p deadman:=0.0
-  wait_log motor 'smart_elex_15d ready' 20    && echo "  [motor]    OK (subscribed to /cmd_vel, power level $MAXLEVEL)"
+     --ros-args -p left_is_a:=false -p max_speed:=0.3 -p max_level:=$MAXLEVEL -p min_level:=1 \
+     -p proportional:=true -p min_duty:=$MOTOR_MIN_DUTY -p invert_right:=true -p deadman:=0.0
+  wait_log motor 'smart_elex_15d ready' 20    && echo "  [motor]    OK (subscribed to /cmd_vel, ceiling level $MAXLEVEL, proportional)"
   echo "[stack] starting foxglove_bridge ..."; /root/rosbg.sh foxglove ros2 launch foxglove_bridge foxglove_bridge_launch.xml num_threads:=2
   # marker is lowercase "Server listening on port" -- the old check grepped
   # "Listening" and so never once matched.
@@ -348,9 +354,16 @@ do_speed() {
   echo "[speed] motor max_level -> $lvl   (saved)"
   if ! running lidar; then echo "[speed] base not up -- applies on next 'start'."; return; fi
   pkill -9 -f l298n_node 2>/dev/null; rm -f /tmp/motor.pid; sleep 1
+  # `speed N` is a CEILING, not a fixed power. It used to pass min_level==max_level==N,
+  # which pinned every nonzero command to one duty and threw away the magnitude of
+  # /cmd_vel -- fine for teleop (go/stop) but it left Nav2 unable to steer: measured
+  # wz=-0.15 and wz=-0.5 rad/s produced the same lurch. The node now runs proportional
+  # over [MIN_DUTY, level N duty], so teleop still tops out at N and Nav2 gets the
+  # continuous range underneath it that DWB assumes it has.
   /root/rosbg.sh motor python3 /root/l298n_node.py \
-     --ros-args -p left_is_a:=false -p max_speed:=0.3 -p max_level:=$lvl -p min_level:=$lvl -p invert_right:=true -p deadman:=0.0
-  echo "[speed] motor restarted. Teleop now uses it; nav picks it up on next 'nav'."
+     --ros-args -p left_is_a:=false -p max_speed:=0.3 -p max_level:=$lvl -p min_level:=1 \
+     -p proportional:=true -p min_duty:=$MOTOR_MIN_DUTY -p invert_right:=true -p deadman:=0.0
+  echo "[speed] motor restarted (proportional, ceiling = level $lvl, min_duty $MOTOR_MIN_DUTY)."
 }
 
 # ---------------------------------------------------------------- status/logs --

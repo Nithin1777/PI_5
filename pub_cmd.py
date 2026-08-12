@@ -27,6 +27,19 @@ wz   = float(sys.argv[3]) if len(sys.argv) > 3 else 0.0
 # so it is sent on every exit path including an exception or a signal.
 DRIVE = min(secs, 10.0)
 msg = Twist(); msg.linear.x = vx; msg.angular.z = wz
+
+# Wait for the motor node to actually MATCH this publisher before starting the clock.
+# DDS discovery takes ~0.2-1 s; without this wait a short pulse (0.6 s) can be spent
+# entirely on discovery, so the rover either never moves or moves for an unpredictable
+# fraction of the requested time. That turns "drive forward a bit" into an unrepeatable
+# experiment -- which matters here because these pulses ARE the measurement.
+# Not fatal if it times out: we publish anyway and report what happened.
+t_disc = time.time()
+while pub.get_subscription_count() == 0 and time.time() - t_disc < 5.0:
+    time.sleep(0.02)
+discovered = pub.get_subscription_count() > 0
+disc_s = time.time() - t_disc
+
 t0 = time.time()
 try:
     while rclpy.ok() and time.time() - t0 < DRIVE:
@@ -38,4 +51,5 @@ finally:
         pub.publish(stop)
         time.sleep(0.02)
     node.destroy_node(); rclpy.shutdown()
-    print(f"published vx={vx} wz={wz} for {min(secs, 10.0):.1f}s, then stop")
+    print(f"published vx={vx} wz={wz} for {DRIVE:.2f}s, then stop "
+          f"(subscriber {'found' if discovered else 'NOT FOUND'} after {disc_s:.2f}s)")
