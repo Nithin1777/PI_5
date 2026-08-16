@@ -24,9 +24,14 @@ echo "--- pose before displacement ---"
 python3 /root/tf_pose.py map base_link
 
 echo "--- displacing (forward, right turn, forward) ---"
-python3 /root/pub_cmd.py 0.6 0.08 0.0  >/dev/null; sleep 3
-python3 /root/pub_cmd.py 0.6 0.0  -0.5 >/dev/null; sleep 3
-python3 /root/pub_cmd.py 1.0 0.10 0.0  >/dev/null; sleep 3
+# Durations were 0.6/0.6/1.0 s. Those were sized when the drivetrain ran 2.93x faster
+# than commanded; after the duty mapping was corrected the same pulses displaced the
+# rover only 0.16 m, so nav started 0.08 m from the goal -- already inside the 0.15 m
+# tolerance, and the "test" measured nothing. Lengthened to restore a displacement big
+# enough that Nav2 actually has to plan and drive.
+python3 /root/pub_cmd.py 2.0 0.10 0.0  >/dev/null; sleep 3
+python3 /root/pub_cmd.py 1.5 0.0  -0.5 >/dev/null; sleep 3
+python3 /root/pub_cmd.py 2.0 0.10 0.0  >/dev/null; sleep 3
 
 echo "--- pose after displacement (start of the run) ---"
 START=$(python3 /root/tf_pose.py map base_link)

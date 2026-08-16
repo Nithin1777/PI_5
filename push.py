@@ -37,7 +37,13 @@ def main():
     sftp.put(local, staging)
     sftp.close()
 
-    cmd = (f"docker cp {staging} rover_ros2:{dest} "
+    # `docker cp` copies the SOURCE file's mode. Pushing a stack.sh that was 644 in the
+    # repo silently stripped +x off /root/stack.sh, and every `~/rover <anything>` then
+    # died with "OCI runtime exec failed: ... permission denied" -- a deploy that
+    # verified its own md5 perfectly while leaving the rover unusable. Restore the bit
+    # explicitly for anything that is executed rather than interpreted.
+    chmod = " && docker exec rover_ros2 chmod +x " + dest if local.endswith(".sh") else ""
+    cmd = (f"docker cp {staging} rover_ros2:{dest}{chmod} "
            f"&& docker exec rover_ros2 md5sum {dest}")
     _, stdout, stderr = cli.exec_command(cmd, timeout=60)
     out = stdout.read().decode(errors="replace").strip()

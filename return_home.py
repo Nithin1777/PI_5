@@ -314,9 +314,8 @@ def main():
             return nav.getResult()
 
         trim_pub = nav.create_publisher(Twist, '/cmd_vel', 10)
-        result = drive_once()
 
-        # --- 4. VERIFY AND CORRECT ---
+        # --- 4. DRIVE, VERIFY AND CORRECT ---
         # Nav2 reporting SUCCEEDED only means its BELIEF reached the goal. Measured on
         # this rover: a run finished with `Goal succeeded` while physically sitting
         # 22.0 deg off (tolerance 11.5), and an earlier one 38 deg off, because the
@@ -325,58 +324,87 @@ def main():
         # check the REAL pose. reseed also republishes /initialpose, so a wrong belief is
         # corrected before the retry -- otherwise the retry would just drive to the same
         # wrong place again, convinced it was already home.
-        if result == TaskResult.SUCCEEDED and args.verify_attempts > 0:
-            for attempt in range(1, args.verify_attempts + 1):
-                time.sleep(2.0)                 # let the pose settle before measuring
-                pose = absolute_pose(args.map_name, publish=True)
-                if pose is None:
-                    print("[return_home] verify: could not establish a true pose -- "
-                          "reporting Nav2's result unchanged.", file=sys.stderr)
-                    break
-                dxy, dyaw = pose_error(pose, args.x, args.y, args.yaw)
-                print(f"[return_home] verify {attempt}/{args.verify_attempts}: true pose "
-                      f"({pose[0]:.3f}, {pose[1]:.3f}, yaw {math.degrees(pose[2]):.1f} deg) "
-                      f"-> off by {dxy:.3f} m / {math.degrees(dyaw):.1f} deg")
-                if dxy <= args.xy_tol and dyaw <= args.yaw_tol:
-                    print("[return_home] verify: within tolerance.")
-                    break
+        # A Nav2 FAILURE used to end the run right here, and that was the single biggest
+        # gap in this script. The two things that actually go wrong on this rover are both
+        # recoverable and neither is recovered by giving up:
+        #   - it wedges itself on furniture (a chair leg), stops moving, and therefore stops
+        #     feeding slam the travel it needs to keep map->odom fresh, so nav2 loses the
+        #     transform and aborts follow_path;
+        #   - it gets picked up and put down somewhere else (freeing it by hand counts).
+        #     slam_toolbox localization only scan-matches LOCALLY around its current
+        #     estimate, so after a manual move its belief is simply wrong and stays wrong,
+        #     and nav2 confidently drives to the wrong place -- "I put it back and it still
+        #     could not find its way home".
+        # reseed.py fixes the second by matching the live scan against the saved map from
+        # scratch, and it was already being run after SUCCESS only. Running it after a
+        # FAILURE is what turns both of these into a retry instead of a dead run.
+        max_attempts = max(1, args.verify_attempts + 1)     # drive attempts, not verifies
+        result = None
+        for attempt in range(1, max_attempts + 1):
+            result = drive_once()
 
-                # Position and heading are corrected by DIFFERENT mechanisms on purpose.
-                # Re-issuing a Nav2 goal to fix a heading-only error is what made this
-                # oscillate before (-21 deg -> +18 deg): DWB does one open-loop rotation
-                # per cycle, and on this non-repeatable chassis that rotation overshoots.
-                # So Nav2 is used only when the POSITION is actually wrong, and the final
-                # heading is closed-loop trimmed with measured pulses.
-                if dxy > args.xy_tol:
-                    if attempt == args.verify_attempts:
-                        print(f"[return_home] verify: STILL off by {dxy:.3f} m / "
-                              f"{math.degrees(dyaw):.1f} deg after {attempt} attempt(s) -- "
-                              f"giving up rather than driving indefinitely.", file=sys.stderr)
-                        result = TaskResult.FAILED
-                        break
-                    print("[return_home] verify: position outside tolerance -- "
-                          "belief corrected, re-driving ...")
-                    time.sleep(2.0)             # let slam absorb the corrected /initialpose
-                    result = drive_once()
-                    if result != TaskResult.SUCCEEDED:
-                        break
-                    continue
+            if result != TaskResult.SUCCEEDED:
+                print(f"[return_home] attempt {attempt}/{max_attempts}: Nav2 did not reach "
+                      f"the goal ({result}).", file=sys.stderr)
+                if attempt == max_attempts:
+                    break
+                print("[return_home] re-localizing from scratch ...")
+                if absolute_pose(args.map_name, publish=True) is None:
+                    print("[return_home] could not re-localize -- giving up.", file=sys.stderr)
+                    break
+                time.sleep(2.0)                 # let slam absorb the corrected /initialpose
+                continue
 
-                print("[return_home] verify: position OK, heading off -- trimming ...")
-                pose = trim_heading(nav, trim_pub, args.map_name, args.yaw, args.yaw_tol)
-                if pose is None:
+            if args.verify_attempts <= 0:
+                break
+
+            time.sleep(2.0)                     # let the pose settle before measuring
+            pose = absolute_pose(args.map_name, publish=True)
+            if pose is None:
+                print("[return_home] verify: could not establish a true pose -- "
+                      "reporting Nav2's result unchanged.", file=sys.stderr)
+                break
+            dxy, dyaw = pose_error(pose, args.x, args.y, args.yaw)
+            print(f"[return_home] verify {attempt}/{max_attempts}: true pose "
+                  f"({pose[0]:.3f}, {pose[1]:.3f}, yaw {math.degrees(pose[2]):.1f} deg) "
+                  f"-> off by {dxy:.3f} m / {math.degrees(dyaw):.1f} deg")
+            if dxy <= args.xy_tol and dyaw <= args.yaw_tol:
+                print("[return_home] verify: within tolerance.")
+                break
+
+            # Position and heading are corrected by DIFFERENT mechanisms on purpose.
+            # Re-issuing a Nav2 goal to fix a heading-only error is what made this
+            # oscillate before (-21 deg -> +18 deg): DWB does one open-loop rotation
+            # per cycle, and on this non-repeatable chassis that rotation overshoots.
+            # So Nav2 is used only when the POSITION is actually wrong, and the final
+            # heading is closed-loop trimmed with measured pulses.
+            if dxy > args.xy_tol:
+                if attempt == max_attempts:
+                    print(f"[return_home] verify: STILL off by {dxy:.3f} m / "
+                          f"{math.degrees(dyaw):.1f} deg after {attempt} attempt(s) -- "
+                          f"giving up rather than driving indefinitely.", file=sys.stderr)
                     result = TaskResult.FAILED
                     break
-                dxy, dyaw = pose_error(pose, args.x, args.y, args.yaw)
-                print(f"[return_home] verify: after trim, off by {dxy:.3f} m / "
-                      f"{math.degrees(dyaw):.1f} deg")
-                if dxy <= args.xy_tol and dyaw <= args.yaw_tol:
-                    print("[return_home] verify: within tolerance.")
-                    break
-                if attempt == args.verify_attempts:
-                    print("[return_home] verify: heading trim did not converge.", file=sys.stderr)
-                    result = TaskResult.FAILED
-                    break
+                print("[return_home] verify: position outside tolerance -- "
+                      "belief corrected, re-driving ...")
+                time.sleep(2.0)                 # let slam absorb the corrected /initialpose
+                continue
+
+            print("[return_home] verify: position OK, heading off -- trimming ...")
+            pose = trim_heading(nav, trim_pub, args.map_name, args.yaw, args.yaw_tol)
+            if pose is None:
+                result = TaskResult.FAILED
+                break
+            dxy, dyaw = pose_error(pose, args.x, args.y, args.yaw)
+            print(f"[return_home] verify: after trim, off by {dxy:.3f} m / "
+                  f"{math.degrees(dyaw):.1f} deg")
+            if dxy <= args.xy_tol and dyaw <= args.yaw_tol:
+                print("[return_home] verify: within tolerance.")
+                break
+            if attempt == max_attempts:
+                print("[return_home] verify: heading trim did not converge.", file=sys.stderr)
+                result = TaskResult.FAILED
+                break
 
         if result == TaskResult.SUCCEEDED:
             print("[return_home] ARRIVED at goal. :-)")

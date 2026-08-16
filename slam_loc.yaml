@@ -21,6 +21,39 @@ slam_toolbox:
 
     debug_logging: false
     throttle_scans: 1
+    scan_queue_size: 10            # DEFAULT IS 1, AND THAT WAS THE NAV KILLER.
+                                   # slam_toolbox does not subscribe to /scan directly. It
+                                   # feeds it through a tf2 MessageFilter keyed on odom,
+                                   # which HOLDS each scan until odom->base_link covers the
+                                   # scan's stamp. rf2o publishes that transform 0.16 s
+                                   # late; scans arrive every 0.10 s. With a queue of ONE
+                                   # the next scan evicts the waiting one before rf2o ever
+                                   # catches up -- "Message Filter dropping message ...
+                                   # discarding message because the queue is full" -- so
+                                   # ~95% of scans never reached laserCallback at all.
+                                   #
+                                   # MEASURED on this rover, parked, on this exact config:
+                                   #                       queue 1      queue 10
+                                   #   map->odom published  50.02 Hz     49.89 Hz
+                                   #   UNIQUE stamps         0.47 Hz      9.85 Hz
+                                   #   worst stamp gap       6.70 s       0.20 s
+                                   #   "queue is full" drops    29            0
+                                   # 9.85 Hz is exactly the scan rate: every scan now lands.
+                                   #
+                                   # THIS IS WHY EVERY OTHER KNOB MEASURED AS INERT. In
+                                   # LocalizationSlamToolbox::laserCallback, the very first
+                                   # line is `scan_header = scan->header;` -- and scan_header
+                                   # is what publishTransformLoop() stamps map->odom with.
+                                   # shouldProcessScan() and the mapper run BELOW that line.
+                                   # So throttle_scans, minimum_travel_distance,
+                                   # minimum_time_interval, map_update_interval and
+                                   # do_loop_closing cannot change the stamp rate by
+                                   # construction, and controlled experiments on all five
+                                   # correctly showed no change. They were all testing
+                                   # downstream of the break.
+                                   #
+                                   # 10 buffers 1.0 s at 10 Hz, ~6x rf2o's lag. Do not set
+                                   # it to 1 again, and re-check it if rf2o's lag grows.
     transform_publish_period: 0.02     # publish map -> odom continuously (0 = never)
     map_update_interval: 5.0
     resolution: 0.05
@@ -29,33 +62,55 @@ slam_toolbox:
     minimum_time_interval: 0.2     # was 0.5. Gates scan processing BY TIME; combined
                                    # with minimum_travel_distance below it decides how
                                    # often map->odom gets a fresh timestamp.
-    transform_timeout: 1.0         # was 0.2. slam_toolbox stamps map->odom as
-                                   # (last PROCESSED scan time + transform_timeout) and
-                                   # then republishes that FROZEN stamp at 50 Hz, so the
-                                   # transform ages at 1 s per second whenever no scan is
-                                   # processed. Measured: raising 0.2 -> 3.0 shifted the
-                                   # stamp ceiling by exactly +2.8 s. This is the validity
-                                   # window each publish buys; 1.0 s comfortably covers the
-                                   # gap between updates at the travel thresholds below.
+    transform_timeout: 1.0         # 0.2 -> 1.0 -> 3.0 -> back to 1.0. slam_toolbox stamps
+                                   # map->odom as (scan_header.stamp + transform_timeout),
+                                   # so this is how far into the future each publish is
+                                   # dated, i.e. the validity window it buys.
+                                   #
+                                   # It was raised to 3.0 to survive multi-second stalls.
+                                   # Those stalls are gone -- they were the scan_queue_size
+                                   # starvation documented above, not a slow correction --
+                                   # so a 3 s future-stamp now buys nothing and actively
+                                   # HIDES real staleness from nav2, which would accept a
+                                   # 3 s old correction without ever logging a complaint.
+                                   # 1.0 is honest and still has ample margin.
+                                   #
+                                   # MEASURED, parked, with scan_queue_size: 10 (tf_age.py):
+                                   #   timeout 3.0 -> age -2.82 s median, worst -2.69 s
+                                   #   timeout 1.0 -> age -0.82 s median, worst -0.71 s
+                                   # i.e. ~0.7 s of headroom over the 0.18 s scan->publish
+                                   # lag, and 0.0% of samples past nav2's 0.5 s costmap
+                                   # tolerance in both cases. Longest stall 0.20 s (one scan
+                                   # period), against 22.17 s before the queue fix.
+                                   #
+                                   # NOTE: this value is ALSO the MessageFilter's tf wait
+                                   # timeout (see setROSInterfaces), so it must stay well
+                                   # above rf2o's 0.16 s odom lag. Do not drop it to 0.2.
+                                   #
+                                   # The "deadlock" this comment used to describe (blocked
+                                   # -> no travel -> no scan -> no transform -> no command)
+                                   # was NOT real. scan_header advances on every CALLBACK,
+                                   # before the travel gate, so a stationary rover has never
+                                   # been what froze the stamp. Verified parked: 9.85 Hz.
     tf_buffer_duration: 30.
     stack_size_to_use: 40000000        # larger stack needed to deserialize big maps
 
     # General Parameters
     use_scan_matching: true
     use_scan_barycenter: true
-    # THESE TWO WERE THE NAV KILLER. slam_toolbox processes a scan only after the
-    # robot has moved this far; until then map->odom keeps its old timestamp. At 0.5 m
-    # in a room whose largest navigable region is ~1.5 m2 (~1.2 m across), the rover
-    # almost never travelled far enough, so map->odom went stale by a measured median
-    # of 4.5 s (worst 12.2 s, 97% of publishes backdated past nav2's 0.5 s tolerance).
-    # DWB then could not transform the robot pose into the global plan's frame ->
-    # "Unable to transform robot pose into global plan's frame" x152 -> "Controller
-    # patience exceeded" x15 -> follow_path aborted. That is the premature stop, and
-    # the frozen-then-jumping pose is why the goal distance read 0.00 m then 1.82 m.
-    # Mapping looked fine because driving by hand covers 0.5 m constantly.
+    # CORRECTION: THESE WERE NEVER THE NAV KILLER. This block used to claim the travel
+    # gate was what let map->odom go stale (median 4.5 s, worst 12.2 s) and that lowering
+    # 0.5 -> 0.1 -> 0.05 fixed it. It fixed nothing, and it could not have:
+    # laserCallback assigns scan_header -- the stamp on map->odom -- on its FIRST line,
+    # BEFORE shouldProcessScan() ever sees these thresholds. The stale stamp was
+    # scan_queue_size (see above). The 4.5 s median recorded here at 0.5 was re-measured
+    # unchanged at 0.05 and at 0.01, which is exactly what "no effect" looks like.
     #
-    # Lowered 0.1 -> 0.05 so map->odom is corrected roughly twice as often while the
-    # rover is actually driving. The reason is measured: with 0.1, a short nav run
+    # What these thresholds DO control is how often a scan is matched into the pose
+    # graph -- how often the correction VALUE changes, not how fresh its TIMESTAMP is.
+    # That is still worth tuning, on its own merits:
+    #
+    # 0.05 rather than 0.1, because with 0.1 a short nav run
     # (~0.3 m with a couple of turns) ended with a heading error almost exactly equal
     # to the error reseed.py started it with -- 0.4 deg in -> 3.0 deg out, 8.9 deg in
     # -> 9.0 deg out. slam_loc was contributing no correction over the run, so the seed
@@ -68,6 +123,9 @@ slam_toolbox:
     # automatically better in a small, feature-poor room; it also injects more of that.
     # 0.05 is a compromise, and return_home.py's verify-and-correct pass is the actual
     # safety net rather than this value.
+    #
+    # Do NOT set these to 0.0 to "force" more updates: two slam_loc startup segfaults
+    # were produced that way, both immediately after message-filter overflow.
     minimum_travel_distance: 0.05
     minimum_travel_heading: 0.05
     scan_buffer_size: 3

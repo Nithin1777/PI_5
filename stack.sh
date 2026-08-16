@@ -29,7 +29,31 @@ MAXLEVEL=$(cat /root/.motor_speed 2>/dev/null || echo 3)   # motor power CEILING
 # duty (= 0 % motor) to 94 % (= 100 %), but below some duty this chassis simply stalls,
 # and commanding into that dead zone makes Nav2 think it is moving when it is not.
 # MEASURED on this rover -- re-measure after any change to tyres, load or battery.
-MOTOR_MIN_DUTY=$(cat /root/.motor_min_duty 2>/dev/null || echo 0.10)
+MOTOR_MIN_DUTY=$(cat /root/.motor_min_duty 2>/dev/null || echo 0.082)
+# Duty CEILING. Normally derived from the `speed N` level, but that ladder is a coarse
+# 9-step grid and the value this chassis actually needs falls between steps, so it can
+# be pinned directly here. Empty = fall back to the level ceiling.
+#
+# MEASURED, and this is the fix for Nav2 overshooting every goal. The speed->duty map is
+#   duty = min_duty + (v / max_speed) * (max_duty - min_duty)
+# with max_speed a NOMINAL 0.3 m/s that had never been checked against the floor. Sweeping
+# commanded speed against distance travelled (speed_check.py, rf2o, cross-checked against
+# an absolute scan-match agreeing to 6 mm over 0.8 m) gave
+#   duty 0.129 -> 0.195 m/s,  0.157 -> 0.279 m/s,  0.186 -> 0.433 m/s
+# i.e. v = 4.18*duty - 0.344, so the rover ran 2.93x FASTER than commanded and crossed
+# zero speed at duty 0.082, not at the 0.10 the mapping was anchored to. DWB plans every
+# trajectory assuming a commanded velocity is the velocity it gets, so a 2.93x gain plus
+# a wrong intercept made the final approach overshoot and hunt: a run finished 0.238 m,
+# then 0.216 m, then 0.100 m from a 0.15 m tolerance, driving 0.42 m to close 0.24 m.
+# min_duty 0.082 (the measured zero crossing) + max_duty 0.154 makes the map affine on
+# the real curve. Re-measured after: gain 2.93x -> 1.60x, and two full return-home cycles
+# landed 0.133 m / 2.0 deg and 0.122 m / 7.0 deg, first attempt, no re-drives.
+# Re-measure with speed_check.py after any change to tyres, tape, load or battery.
+MOTOR_MAX_DUTY=$(cat /root/.motor_max_duty 2>/dev/null || echo 0.154)
+# Unquoted on use, so an empty value contributes no argument at all and the node falls
+# back to deriving the ceiling from max_level -- the pre-calibration behaviour.
+MOTOR_MAX_DUTY_ARG=""
+[ -n "$MOTOR_MAX_DUTY" ] && MOTOR_MAX_DUTY_ARG="-p max_duty:=$MOTOR_MAX_DUTY"
 
 # ---------------------------------------------------------------- helpers -----
 ensure_slam_yaml() {
@@ -185,8 +209,9 @@ do_start() {
   echo "[stack] starting motor (SmartElex) ."
   /root/rosbg.sh motor python3 /root/l298n_node.py \
      --ros-args -p left_is_a:=false -p max_speed:=0.3 -p max_level:=$MAXLEVEL -p min_level:=1 \
-     -p proportional:=true -p min_duty:=$MOTOR_MIN_DUTY -p invert_right:=true -p deadman:=0.0
-  wait_log motor 'smart_elex_15d ready' 20    && echo "  [motor]    OK (subscribed to /cmd_vel, ceiling level $MAXLEVEL, proportional)"
+     -p proportional:=true -p min_duty:=$MOTOR_MIN_DUTY $MOTOR_MAX_DUTY_ARG \
+     -p invert_right:=true -p deadman:=0.0
+  wait_log motor 'smart_elex_15d ready' 20    && echo "  [motor]    OK (subscribed to /cmd_vel, duty ${MOTOR_MIN_DUTY}..${MOTOR_MAX_DUTY:-level $MAXLEVEL}, proportional)"
   echo "[stack] starting foxglove_bridge ..."; /root/rosbg.sh foxglove ros2 launch foxglove_bridge foxglove_bridge_launch.xml num_threads:=2
   # marker is lowercase "Server listening on port" -- the old check grepped
   # "Listening" and so never once matched.
@@ -334,7 +359,11 @@ do_nav() {
     echo "[nav] Nav2 did not come up in 40s -- check 'logs nav'."; exit 1; fi
   echo "[nav] Nav2 up -- returning to origin (map 0,0,0) ..."
   echo "          (Ctrl-C here only stops the driver; Nav2 stays up. Use 'nav stop' to end.)"
-  python3 /root/return_home.py --map-name "$name" --no-amcl
+  # -u is not cosmetic. `nav` is normally run with its output redirected to a file, so
+  # python block-buffers stdout; when return_home was SIGKILLed mid-run every progress
+  # line it had printed died in that buffer and the log showed only the stderr lines,
+  # which made a killed run look like a run that never started.
+  python3 -u /root/return_home.py --map-name "$name" --no-amcl
 }
 
 do_navstop() { pkill_nav; pkill_slam; sleep 1; echo "[nav stop] Nav2 + slam localization killed (base still up)."; }
@@ -362,8 +391,17 @@ do_speed() {
   # continuous range underneath it that DWB assumes it has.
   /root/rosbg.sh motor python3 /root/l298n_node.py \
      --ros-args -p left_is_a:=false -p max_speed:=0.3 -p max_level:=$lvl -p min_level:=1 \
-     -p proportional:=true -p min_duty:=$MOTOR_MIN_DUTY -p invert_right:=true -p deadman:=0.0
+     -p proportional:=true -p min_duty:=$MOTOR_MIN_DUTY $MOTOR_MAX_DUTY_ARG \
+     -p invert_right:=true -p deadman:=0.0
   echo "[speed] motor restarted (proportional, ceiling = level $lvl, min_duty $MOTOR_MIN_DUTY)."
+  if [ -n "$MOTOR_MAX_DUTY" ]; then
+    # An explicit max_duty WINS over max_level in l298n_node.py, so without this warning
+    # `speed 5` would appear to do nothing and look like a bug.
+    echo "[speed] NOTE: a calibrated duty ceiling ($MOTOR_MAX_DUTY, /root/.motor_max_duty)"
+    echo "[speed]       is in force and OVERRIDES level $lvl. It is what keeps commanded"
+    echo "[speed]       m/s close to actual m/s -- Nav2 overshot every goal without it."
+    echo "[speed]       To go back to the level ladder:  rm /root/.motor_max_duty"
+  fi
 }
 
 # ---------------------------------------------------------------- status/logs --
